@@ -1,0 +1,9 @@
+features:
+  use_reproduction: true
+  use_combat: true
+  use_communication: false
+  use_terraforming: false
+
+action_rewards:
+  MOVE: 0.01
+  ATTACK: -0.01
