@@ -1,0 +1,87 @@
+"""个体状态与批量管理工具。"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict
+
+import torch
+
+
+@dataclass
+class AgentState:
+    """单个体的基础状态。"""
+
+    position: torch.Tensor  # (2,)
+    energy: torch.Tensor
+    health: torch.Tensor
+    age: torch.Tensor
+    mood: torch.Tensor  # 预留情绪向量
+    communication_buffer: torch.Tensor  # (2,)
+    genome_id: torch.Tensor
+    generation: torch.Tensor
+
+
+class AgentBatch:
+    """批量个体管理，便于 GPU 向量化处理。"""
+
+    def __init__(self, num_envs: int, agents_per_env: int, device: torch.device):
+        self.num_envs = num_envs
+        self.agents_per_env = agents_per_env
+        self.device = device
+        self.state = self._allocate_state()
+
+    def _allocate_state(self) -> Dict[str, torch.Tensor]:
+        shape = (self.num_envs, self.agents_per_env)
+        return {
+            "x": torch.zeros(shape, dtype=torch.int64, device=self.device),
+            "y": torch.zeros(shape, dtype=torch.int64, device=self.device),
+            "energy": torch.zeros(shape, dtype=torch.float32, device=self.device),
+            "health": torch.zeros(shape, dtype=torch.float32, device=self.device),
+            "age": torch.zeros(shape, dtype=torch.int64, device=self.device),
+            "mood": torch.zeros(shape + (2,), dtype=torch.float32, device=self.device),
+            "comm": torch.zeros(shape + (2,), dtype=torch.int64, device=self.device),
+            "genome_id": torch.zeros(shape, dtype=torch.int64, device=self.device),
+            "generation": torch.zeros(shape, dtype=torch.int64, device=self.device),
+        }
+
+    def reset(self, height: int, width: int) -> None:
+        """随机初始化个体位置与基本状态。"""
+
+        self.state["x"].random_(0, width)
+        self.state["y"].random_(0, height)
+        self.state["energy"].fill_(50)
+        self.state["health"].fill_(100)
+        self.state["age"].zero_()
+        self.state["mood"].zero_()
+        self.state["comm"].zero_()
+        self.state["genome_id"].zero_()
+        self.state["generation"].zero_()
+
+    def apply_actions(self, actions: torch.Tensor, height: int, width: int) -> None:
+        """根据动作更新坐标，占位版本仅处理移动。"""
+
+        actions = actions.view(self.num_envs, self.agents_per_env)
+        dx = torch.zeros_like(actions)
+        dy = torch.zeros_like(actions)
+        dx = torch.where(actions == 3, -1, dx)  # 左
+        dx = torch.where(actions == 4, 1, dx)  # 右
+        dy = torch.where(actions == 1, -1, dy)  # 上
+        dy = torch.where(actions == 2, 1, dy)  # 下
+
+        self.state["x"] = (self.state["x"] + dx).clamp(0, width - 1)
+        self.state["y"] = (self.state["y"] + dy).clamp(0, height - 1)
+        self.state["age"] += 1
+
+    def export_state(self) -> torch.Tensor:
+        """打包状态为 `(E, A, D)` 张量，便于策略读取。"""
+
+        return torch.stack(
+            [
+                self.state["x"].float(),
+                self.state["y"].float(),
+                self.state["energy"],
+                self.state["health"],
+                self.state["age"].float(),
+            ],
+            dim=-1,
+        )

@@ -1,0 +1,43 @@
+world:
+  height: 64
+  width: 64
+  food_respawn_steps: 50
+  toxin_decay_steps: 80
+  random_seed: 42
+
+agents:
+  per_env: 32
+  base_energy: 50
+  base_health: 100
+  base_metabolism_cost: 1.0
+  move_cost: 0.2
+  communication_cost: 0.1
+  reproduction_energy_threshold: 80
+  child_energy_fraction: 0.3
+
+training:
+  num_envs: 32
+  rollout_steps: 128
+  gamma: 0.99
+  gae_lambda: 0.95
+  ppo_clip: 0.2
+
+features:
+  use_reproduction: true
+  use_combat: true
+  use_communication: true
+  use_terraforming: true
+
+logging:
+  snapshot_interval: 50
+  realtime_render: false
+  save_dir: runs/default
+
+action_rewards:
+  MOVE: 0.01
+  EAT: 0.0
+  ATTACK: 0.0
+  COMMUNICATE: 0.0
+  BUILD: 0.0
+  REMOVE: 0.0
+  REPRODUCE: 0.1
