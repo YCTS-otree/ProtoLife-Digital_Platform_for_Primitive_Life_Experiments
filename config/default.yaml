@@ -1,6 +1,7 @@
 world:
   height: 64
   width: 64
+  map_file: null
   food_respawn_steps: 50
   toxin_decay_steps: 80
   random_seed: 42
@@ -21,6 +22,8 @@ training:
   gamma: 0.99
   gae_lambda: 0.95
   ppo_clip: 0.2
+  save_interval: 100
+  checkpoint_dir: checkpoints
 
 features:
   use_reproduction: true

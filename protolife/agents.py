@@ -85,3 +85,17 @@ class AgentBatch:
             ],
             dim=-1,
         )
+
+    def state_dict(self) -> Dict[str, torch.Tensor]:
+        """导出完整内部状态，方便 checkpoint。"""
+
+        return {k: v.detach().cpu() for k, v in self.state.items()}
+
+    def load_state_dict(self, state_dict: Dict[str, torch.Tensor], height: int, width: int) -> None:
+        """从 checkpoint 恢复内部状态，并确保尺寸匹配当前环境。"""
+
+        self.state = {k: v.to(self.device) for k, v in state_dict.items()}
+        if self.state["x"].shape != (self.num_envs, self.agents_per_env):
+            raise ValueError("载入的个体状态尺寸与当前设置不一致")
+        self.state["x"] = self.state["x"].clamp(0, width - 1)
+        self.state["y"] = self.state["y"].clamp(0, height - 1)

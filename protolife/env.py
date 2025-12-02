@@ -5,12 +5,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 import torch
 
 from .agents import AgentBatch
-from .encoding import encode_grid
+from .encoding import decode_hex_to_grid, encode_grid, load_hex_map
 from .rewards import build_action_reward_table
 
 
@@ -38,12 +39,14 @@ class ProtoLifeEnv:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.height = config.get("world", {}).get("height", 64)
         self.width = config.get("world", {}).get("width", 64)
+        self.map_file = config.get("world", {}).get("map_file")
         self.action_rewards = build_action_reward_table(config.get("action_rewards", {}))
         self.agent_batch = AgentBatch(
             num_envs=config.get("training", {}).get("num_envs", 1),
             agents_per_env=config.get("agents", {}).get("per_env", 1),
             device=self.device,
         )
+        self._map_template = self._load_map_template().to(self.device)
         self.map_state = torch.zeros(
             (self.agent_batch.num_envs, self.height, self.width), dtype=torch.int64, device=self.device
         )
@@ -55,7 +58,7 @@ class ProtoLifeEnv:
         实际实验中可替换为带食物/毒素分布的初始化逻辑。
         """
 
-        self.map_state.zero_()
+        self.map_state = self._map_template.clone().expand(self.agent_batch.num_envs, -1, -1).contiguous()
         self.agent_batch.reset(self.height, self.width)
         return self._build_observations()
 
@@ -91,3 +94,37 @@ class ProtoLifeEnv:
 
         encoded = encode_grid(self.map_state)
         print(f"Encoded map snapshot: {encoded[:16]} ...")
+
+    def export_state(self) -> Dict[str, torch.Tensor]:
+        """导出环境状态用于 checkpoint。"""
+
+        return {
+            "map_state": self.map_state.detach().cpu(),
+            "agent_state": self.agent_batch.state_dict(),
+        }
+
+    def load_state(self, state: Dict[str, torch.Tensor]) -> None:
+        """从 checkpoint 恢复环境与个体状态。"""
+
+        self.map_state = state["map_state"].to(self.device)
+        self._map_template = self.map_state[:1].clone()
+        self.agent_batch.load_state_dict(state["agent_state"], self.height, self.width)
+
+    def _load_map_template(self) -> torch.Tensor:
+        """加载单张地图模板，若未指定则返回全零地图。"""
+
+        if not self.map_file:
+            return torch.zeros((1, self.height, self.width), dtype=torch.int64)
+
+        map_path = Path(self.map_file)
+        if not map_path.exists():
+            print(f"[警告] map_file={map_path} 不存在，回退到随机地图")
+            return torch.zeros((1, self.height, self.width), dtype=torch.int64)
+
+        try:
+            hex_string = load_hex_map(map_path)
+            grid = decode_hex_to_grid(hex_string, height=self.height, width=self.width).to(torch.int64)
+            return grid.unsqueeze(0)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[警告] 地图解码失败 {exc}，回退到随机地图")
+            return torch.zeros((1, self.height, self.width), dtype=torch.int64)
