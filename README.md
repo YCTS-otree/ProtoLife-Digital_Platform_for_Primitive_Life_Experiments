@@ -40,16 +40,17 @@ maps/
 ```
 
 ## 快速开始（可直接运行的最小 Demo）
-> 当前仓库提供的是“可跑通流程”的最小原型：环境、策略与配置均为占位实现，但可以直接执行一轮前向推理与环境步进，用于验证依赖安装和配置是否正确。
+> 当前仓库提供的是“可跑通流程”的最小原型：环境、策略与配置均为占位实现或基本实现，但可以直接执行一轮前向推理与环境步进，用于验证依赖安装和配置是否正确。
 
 1. **准备 Python 环境**
    - 建议 Python 3.9+，可用 `python -m venv .venv && source .venv/bin/activate` 创建虚拟环境。
    - 安装依赖（CPU 版本示例）：`pip install torch pyyaml`。
    - 若需要 GPU/CUDA，请根据显卡与 CUDA 版本替换为官方给出的 `pip install torch==<ver>+cu118 -f https://download.pytorch.org/whl/torch_stable.html`。
 
-2. **运行占位 Demo**
+2. **运行基本 Demo**
+   tip:请在项目根目录运行
    ```bash
-   python scripts/train_phase0.py --config config/phase0_survival.yaml
+   python -m scripts.train_phase0 --config config/phase0_survival.yaml
    ```
    预期输出：
    - 打印观测张量的形状（map 与 agents）
