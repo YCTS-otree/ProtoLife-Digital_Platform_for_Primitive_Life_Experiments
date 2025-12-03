@@ -80,13 +80,13 @@ maps/
    - 使用命令行编辑器快速制作地图：
      ```bash
      # 从空白 16x16 地图开始编辑，保存到 maps/custom_xxx.hex
-     python scripts/map_editor.py --width 16 --height 16
+     python -m scripts.map_editor --width 16 --height 16
 
      # 基于已有地图微调
-     python scripts/map_editor.py --input maps/default_map.hex --width 8 --height 8 --output maps/my_map.hex
+     python -m scripts.map_editor --input maps/default_map.hex --width 8 --height 8 --output maps/my_map.hex
 
      # 打开 matplotlib 图形界面，点击涂抹/按 n 切换笔刷类型
-     python scripts/map_editor.py --width 16 --height 16 --gui
+     python -m scripts.map_editor --width 16 --height 16 --gui
      ```
 
 6. **模型与环境 checkpoint / 断点续推**
@@ -98,10 +98,10 @@ maps/
    - 示例：
      ```bash
      # 带定期保存
-     python scripts/train_phase0.py --config config/phase0_survival.yaml --save-interval 50 --checkpoint-dir checkpoints/demo
+     python -m scripts.train_phase0 --config config/phase0_survival.yaml --save-interval 50 --checkpoint-dir checkpoints/demo
 
      # 从指定存档继续
-     python scripts/train_phase0.py --config config/phase0_survival.yaml --resume-from checkpoints/demo/full_step_200.pt
+     python -m scripts.train_phase0 --config config/phase0_survival.yaml --resume-from checkpoints/demo/full_step_200.pt
      ```
 
    - checkpoint 内容包括：当前地图、全部 agent 状态、策略网络参数、优化器参数与当前步数，可直接用于“继续推演”或模型回滚。
