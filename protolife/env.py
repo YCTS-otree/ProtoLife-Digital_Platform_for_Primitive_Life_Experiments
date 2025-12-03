@@ -40,7 +40,7 @@ class ProtoLifeEnv:
         self.height = config.get("world", {}).get("height", 64)
         self.width = config.get("world", {}).get("width", 64)
         self.map_file = config.get("world", {}).get("map_file")
-        self.action_rewards = build_action_reward_table(config.get("action_rewards", {}))
+        self.action_rewards = build_action_reward_table(config.get("action_rewards", {})).to(self.device)
         self.agent_batch = AgentBatch(
             num_envs=config.get("training", {}).get("num_envs", 1),
             agents_per_env=config.get("agents", {}).get("per_env", 1),
@@ -72,14 +72,39 @@ class ProtoLifeEnv:
         后续可逐步填充能量代谢、食物/毒素交互、战斗等细节。
         """
 
+        # 1. 确保 actions 跟环境在同一设备，类型是 long
+        actions = torch.as_tensor(
+            actions,
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        # 2. 更新个体位置
         self.agent_batch.apply_actions(actions, self.height, self.width)
+
+        # 3. 查表拿基础奖励（此时 action_rewards 也已经在 self.device 上）
+        base_rewards = self.action_rewards[actions]
+
+        dones = torch.zeros_like(base_rewards, dtype=torch.bool)
+        infos: List[Dict] = [
+            {"message": "占位环境，无终止条件"} 
+            for _ in range(self.agent_batch.num_envs * self.agent_batch.agents_per_env)
+        ]
+        observations = self._build_observations()
+        return EnvStepResult(
+            observations=observations,
+            rewards=base_rewards,
+            dones=dones,
+            infos=infos,
+        )
+        '''self.agent_batch.apply_actions(actions, self.height, self.width)
         base_rewards = self.action_rewards[actions]
         dones = torch.zeros_like(base_rewards, dtype=torch.bool)
         infos: List[Dict] = [
             {"message": "占位环境，无终止条件"} for _ in range(self.agent_batch.num_envs * self.agent_batch.agents_per_env)
         ]
         observations = self._build_observations()
-        return EnvStepResult(observations=observations, rewards=base_rewards, dones=dones, infos=infos)
+        return EnvStepResult(observations=observations, rewards=base_rewards, dones=dones, infos=infos)'''
 
     def _build_observations(self) -> Dict[str, torch.Tensor]:
         """构建供策略网络使用的张量观测。"""
