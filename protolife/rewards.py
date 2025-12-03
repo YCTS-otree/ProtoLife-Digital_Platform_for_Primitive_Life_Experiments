@@ -6,6 +6,7 @@ from typing import Dict
 import torch
 
 BASE_ACTION_REWARD = {
+    "STAY": -0.005,
     "MOVE": 0.01,
     "EAT": 0.0,
     "ATTACK": 0.0,

@@ -43,9 +43,9 @@ class MLPPolicy(nn.Module):
         return self.policy_head(x), self.value_head(x)
 
 
-def build_policy(config: Dict) -> MLPPolicy:
+def build_policy(config: Dict, obs_dim: int | None = None) -> MLPPolicy:
     """根据配置构建策略网络。"""
 
     hidden = config.get("model", {}).get("hidden", 128)
-    obs_dim = config.get("model", {}).get("obs_dim", 5)
-    return MLPPolicy(obs_dim=obs_dim, hidden_dim=hidden)
+    inferred_dim = obs_dim or config.get("model", {}).get("obs_dim", 5)
+    return MLPPolicy(obs_dim=inferred_dim, hidden_dim=hidden)

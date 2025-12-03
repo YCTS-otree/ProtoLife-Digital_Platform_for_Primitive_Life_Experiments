@@ -44,21 +44,21 @@ class AgentBatch:
             "generation": torch.zeros(shape, dtype=torch.int64, device=self.device),
         }
 
-    def reset(self, height: int, width: int) -> None:
+    def reset(self, height: int, width: int, base_energy: float = 50, base_health: float = 100) -> None:
         """随机初始化个体位置与基本状态。"""
 
         self.state["x"].random_(0, width)
         self.state["y"].random_(0, height)
-        self.state["energy"].fill_(50)
-        self.state["health"].fill_(100)
+        self.state["energy"].fill_(base_energy)
+        self.state["health"].fill_(base_health)
         self.state["age"].zero_()
         self.state["mood"].zero_()
         self.state["comm"].zero_()
         self.state["genome_id"].zero_()
         self.state["generation"].zero_()
 
-    def apply_actions(self, actions: torch.Tensor, height: int, width: int) -> None:
-        """根据动作更新坐标，占位版本仅处理移动。"""
+    def apply_actions(self, actions: torch.Tensor, height: int, width: int, map_state: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """根据动作更新坐标，仅处理移动并返回移动/碰撞信息。"""
 
         actions = actions.view(self.num_envs, self.agents_per_env)
         dx = torch.zeros_like(actions)
@@ -68,9 +68,21 @@ class AgentBatch:
         dy = torch.where(actions == 1, -1, dy)  # 上
         dy = torch.where(actions == 2, 1, dy)  # 下
 
-        self.state["x"] = (self.state["x"] + dx).clamp(0, width - 1)
-        self.state["y"] = (self.state["y"] + dy).clamp(0, height - 1)
+        proposed_x = (self.state["x"] + dx).clamp(0, width - 1)
+        proposed_y = (self.state["y"] + dy).clamp(0, height - 1)
+
+        env_ids = torch.arange(self.num_envs, device=self.device).unsqueeze(1).expand_as(actions)
+        wall_mask = (map_state[env_ids, proposed_y, proposed_x] & 1).bool()
+
+        new_x = torch.where(wall_mask, self.state["x"], proposed_x)
+        new_y = torch.where(wall_mask, self.state["y"], proposed_y)
+        moved = (new_x != self.state["x"]) | (new_y != self.state["y"])
+
+        self.state["x"] = new_x
+        self.state["y"] = new_y
         self.state["age"] += 1
+
+        return {"moved": moved, "collided": wall_mask}
 
     def export_state(self) -> torch.Tensor:
         """打包状态为 `(E, A, D)` 张量，便于策略读取。"""

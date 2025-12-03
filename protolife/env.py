@@ -8,10 +8,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import matplotlib.pyplot as plt
 import torch
+import torch.nn.functional as F
 
 from .agents import AgentBatch
-from .encoding import decode_hex_to_grid, encode_grid, load_hex_map
+from .encoding import (
+    BIT_BUILDABLE,
+    BIT_FOOD,
+    BIT_RESOURCE,
+    BIT_TERRAIN_0,
+    BIT_TOXIN,
+    decode_hex_to_grid,
+    encode_grid,
+    load_hex_map,
+)
 from .rewards import build_action_reward_table
 
 
@@ -40,7 +51,10 @@ class ProtoLifeEnv:
         self.height = config.get("world", {}).get("height", 64)
         self.width = config.get("world", {}).get("width", 64)
         self.map_file = config.get("world", {}).get("map_file")
-        self.action_rewards = build_action_reward_table(config.get("action_rewards", {})).to(self.device)
+        self.observation_radius = config.get("model", {}).get("observation_radius", 2)
+        self.food_density = config.get("world", {}).get("food_density", 0.02)
+        self.toxin_density = config.get("world", {}).get("toxin_density", 0.01)
+        self.action_rewards = build_action_reward_table(config.get("action_rewards", {}))
         self.agent_batch = AgentBatch(
             num_envs=config.get("training", {}).get("num_envs", 1),
             agents_per_env=config.get("agents", {}).get("per_env", 1),
@@ -50,6 +64,11 @@ class ProtoLifeEnv:
         self.map_state = torch.zeros(
             (self.agent_batch.num_envs, self.height, self.width), dtype=torch.int64, device=self.device
         )
+        self.renderer = None
+        if config.get("logging", {}).get("realtime_render", False):
+            self.renderer = GridRenderer(self.height, self.width)
+
+        self.observation_dim = self._calculate_observation_dim()
 
     def reset(self) -> Dict[str, torch.Tensor]:
         """重置环境，返回初始观测。
@@ -58,8 +77,17 @@ class ProtoLifeEnv:
         实际实验中可替换为带食物/毒素分布的初始化逻辑。
         """
 
-        self.map_state = self._map_template.clone().expand(self.agent_batch.num_envs, -1, -1).contiguous()
-        self.agent_batch.reset(self.height, self.width)
+        if self.map_file:
+            self.map_state = self._map_template.clone().expand(self.agent_batch.num_envs, -1, -1).contiguous()
+        else:
+            self.map_state = self._generate_random_map().to(self.device)
+        self._scatter_resources()
+        self.agent_batch.reset(
+            self.height,
+            self.width,
+            base_energy=self.config.get("agents", {}).get("base_energy", 50),
+            base_health=self.config.get("agents", {}).get("base_health", 100),
+        )
         return self._build_observations()
 
     def step(self, actions: torch.Tensor) -> EnvStepResult:
@@ -72,46 +100,72 @@ class ProtoLifeEnv:
         后续可逐步填充能量代谢、食物/毒素交互、战斗等细节。
         """
 
-        # 1. 确保 actions 跟环境在同一设备，类型是 long
-        actions = torch.as_tensor(
-            actions,
-            dtype=torch.long,
-            device=self.device,
-        )
-
-        # 2. 更新个体位置
-        self.agent_batch.apply_actions(actions, self.height, self.width)
-
-        # 3. 查表拿基础奖励（此时 action_rewards 也已经在 self.device 上）
+        move_info = self.agent_batch.apply_actions(actions, self.height, self.width, self.map_state)
         base_rewards = self.action_rewards[actions]
 
-        dones = torch.zeros_like(base_rewards, dtype=torch.bool)
+        rewards = base_rewards.view(self.agent_batch.num_envs, self.agent_batch.agents_per_env)
+        rewards = rewards.clone()
+        energy = self.agent_batch.state["energy"]
+        health = self.agent_batch.state["health"]
+
+        # 基础代谢与移动消耗
+        base_metabolism = self.config.get("agents", {}).get("base_metabolism_cost", 1.0)
+        move_cost = self.config.get("agents", {}).get("move_cost", 0.2)
+        energy_cost = base_metabolism + move_cost * move_info["moved"].float()
+        energy.sub_(energy_cost)
+
+        # 撞墙轻微惩罚
+        rewards = torch.where(move_info["collided"], rewards - 0.02, rewards)
+
+        # 交互：食物/毒素
+        env_ids = torch.arange(self.agent_batch.num_envs, device=self.device).unsqueeze(1).expand_as(actions)
+        x = self.agent_batch.state["x"]
+        y = self.agent_batch.state["y"]
+        current_cells = self.map_state[env_ids, y, x]
+
+        eat_mask = actions.view_as(x) == 5
+        food_mask = (current_cells & BIT_FOOD).bool()
+        eat_success = eat_mask & food_mask
+        rewards = torch.where(eat_success, rewards + 1.0, rewards)
+        energy = torch.where(eat_success, energy + 10.0, energy)
+        self.map_state[env_ids, y, x] = torch.where(eat_success, current_cells & (~BIT_FOOD), current_cells)
+
+        toxin_mask = (current_cells & BIT_TOXIN).bool()
+        rewards = torch.where(toxin_mask, rewards - 0.5, rewards)
+        health = torch.where(toxin_mask, health - 5.0, health)
+
+        self.agent_batch.state["energy"] = energy
+        self.agent_batch.state["health"] = health
+
+        # 生存奖励，鼓励活着
+        rewards += 0.001
+
+        dones = (energy <= 0) | (health <= 0)
         infos: List[Dict] = [
-            {"message": "占位环境，无终止条件"} 
-            for _ in range(self.agent_batch.num_envs * self.agent_batch.agents_per_env)
+            {"message": "存活状态" if not dones.view(-1)[i] else "能量或健康耗尽"}
+            for i in range(self.agent_batch.num_envs * self.agent_batch.agents_per_env)
         ]
+
         observations = self._build_observations()
-        return EnvStepResult(
-            observations=observations,
-            rewards=base_rewards,
-            dones=dones,
-            infos=infos,
-        )
-        '''self.agent_batch.apply_actions(actions, self.height, self.width)
-        base_rewards = self.action_rewards[actions]
-        dones = torch.zeros_like(base_rewards, dtype=torch.bool)
-        infos: List[Dict] = [
-            {"message": "占位环境，无终止条件"} for _ in range(self.agent_batch.num_envs * self.agent_batch.agents_per_env)
-        ]
-        observations = self._build_observations()
-        return EnvStepResult(observations=observations, rewards=base_rewards, dones=dones, infos=infos)'''
+        if self.renderer:
+            self.renderer.render(self.map_state[0], self.agent_batch.state)
+
+        return EnvStepResult(observations=observations, rewards=rewards.view(-1), dones=dones.view(-1), infos=infos)
 
     def _build_observations(self) -> Dict[str, torch.Tensor]:
         """构建供策略网络使用的张量观测。"""
 
+        agent_state = self.agent_batch.export_state()
+        local_maps = self._extract_local_observation()
+        agent_features = self._normalize_agent_features(agent_state)
+        flat_local = local_maps.view(self.agent_batch.num_envs * self.agent_batch.agents_per_env, -1)
+        flat_agent = agent_features.view(self.agent_batch.num_envs * self.agent_batch.agents_per_env, -1)
+        agent_obs = torch.cat([flat_local, flat_agent], dim=-1)
+
         return {
             "map": self.map_state.clone(),
-            "agents": self.agent_batch.export_state(),
+            "agents": agent_state,
+            "agent_obs": agent_obs,
         }
 
     def render(self) -> None:
@@ -153,3 +207,105 @@ class ProtoLifeEnv:
         except Exception as exc:  # noqa: BLE001
             print(f"[警告] 地图解码失败 {exc}，回退到随机地图")
             return torch.zeros((1, self.height, self.width), dtype=torch.int64)
+
+    def _generate_random_map(self) -> torch.Tensor:
+        """按密度随机生成含墙/食物/毒素的地图。"""
+
+        grid = torch.zeros((self.agent_batch.num_envs, self.height, self.width), dtype=torch.int64, device=self.device)
+        # 简单边界墙
+        grid[:, 0, :] |= BIT_TERRAIN_0
+        grid[:, -1, :] |= BIT_TERRAIN_0
+        grid[:, :, 0] |= BIT_TERRAIN_0
+        grid[:, :, -1] |= BIT_TERRAIN_0
+        return grid
+
+    def _scatter_resources(self) -> None:
+        """在地图上随机撒食物和毒素，便于快速获得奖励信号。"""
+
+        if self.food_density <= 0 and self.toxin_density <= 0:
+            return
+
+        food_mask = torch.rand((self.agent_batch.num_envs, self.height, self.width), device=self.device) < self.food_density
+        toxin_mask = torch.rand((self.agent_batch.num_envs, self.height, self.width), device=self.device) < self.toxin_density
+        self.map_state = self.map_state.clone()
+        self.map_state = torch.where(food_mask, self.map_state | BIT_FOOD, self.map_state)
+        self.map_state = torch.where(toxin_mask, self.map_state | BIT_TOXIN, self.map_state)
+
+    def _extract_local_observation(self) -> torch.Tensor:
+        """裁剪每个体周围 r 范围内的网格并转为 multi-hot 通道。"""
+
+        radius = self.observation_radius
+        padded = F.pad(self.map_state, (radius, radius, radius, radius))
+        patches: List[torch.Tensor] = []
+        for env_idx in range(self.agent_batch.num_envs):
+            env_grid = padded[env_idx]
+            for agent_idx in range(self.agent_batch.agents_per_env):
+                x = int(self.agent_batch.state["x"][env_idx, agent_idx].item()) + radius
+                y = int(self.agent_batch.state["y"][env_idx, agent_idx].item()) + radius
+                patch = env_grid[y - radius : y + radius + 1, x - radius : x + radius + 1]
+                channel_patch = self._cell_to_channels(patch)
+                patches.append(channel_patch)
+        return torch.stack(patches, dim=0)
+
+    def _cell_to_channels(self, patch: torch.Tensor) -> torch.Tensor:
+        """将单通道 bit map 转为 multi-hot 通道。"""
+
+        channels = [
+            (patch & BIT_TERRAIN_0) > 0,
+            (patch & BIT_BUILDABLE) > 0,
+            (patch & BIT_FOOD) > 0,
+            (patch & BIT_TOXIN) > 0,
+            (patch & BIT_RESOURCE) > 0,
+        ]
+        return torch.stack([c.float() for c in channels], dim=-1)
+
+    def _normalize_agent_features(self, agent_state: torch.Tensor) -> torch.Tensor:
+        """归一化坐标/能量/健康，避免数值尺度差异。"""
+
+        x = agent_state[..., 0] / max(self.width - 1, 1)
+        y = agent_state[..., 1] / max(self.height - 1, 1)
+        energy = agent_state[..., 2] / max(self.config.get("agents", {}).get("base_energy", 50), 1)
+        health = agent_state[..., 3] / max(self.config.get("agents", {}).get("base_health", 100), 1)
+        age = agent_state[..., 4] / max(self.config.get("training", {}).get("rollout_steps", 128), 1)
+        return torch.stack([x, y, energy, health, age], dim=-1)
+
+    def _calculate_observation_dim(self) -> int:
+        """计算单个 agent 的观测维度，便于构建策略网络。"""
+
+        patch_cells = (2 * self.observation_radius + 1) ** 2
+        patch_channels = 5  # terrain/buildable/food/toxin/resource
+        agent_feature_dim = 5
+        return patch_cells * patch_channels + agent_feature_dim
+
+
+class GridRenderer:
+    """基于 matplotlib 的简易实时可视化，与 map_editor 交互风格一致。"""
+
+    def __init__(self, height: int, width: int) -> None:
+        self.height = height
+        self.width = width
+        plt.ion()
+        self.fig, self.ax = plt.subplots()
+        self.img = None
+
+    def _to_display(self, grid: torch.Tensor) -> torch.Tensor:
+        """将 bit map 转换为简单的调色板索引。"""
+
+        display = torch.zeros_like(grid, dtype=torch.float32)
+        display = torch.where((grid & BIT_TERRAIN_0) > 0, torch.tensor(0.2), display)
+        display = torch.where((grid & BIT_FOOD) > 0, torch.tensor(0.8), display)
+        display = torch.where((grid & BIT_TOXIN) > 0, torch.tensor(0.5), display)
+        display = torch.where((grid & BIT_RESOURCE) > 0, torch.tensor(0.6), display)
+        return display
+
+    def render(self, grid: torch.Tensor, agent_state: Dict[str, torch.Tensor]) -> None:
+        display = self._to_display(grid.cpu())
+        if self.img is None:
+            self.img = self.ax.imshow(display, cmap="viridis", vmin=0, vmax=1)
+        else:
+            self.img.set_data(display)
+        self.ax.collections.clear()
+        xs = agent_state["x"][0].cpu()
+        ys = agent_state["y"][0].cpu()
+        self.ax.scatter(xs, ys, c="red", s=10)
+        plt.pause(0.001)

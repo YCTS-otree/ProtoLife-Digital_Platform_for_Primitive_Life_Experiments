@@ -2,9 +2,15 @@ world:
   height: 64
   width: 64
   map_file: null
+  food_density: 0.03
+  toxin_density: 0.01
   food_respawn_steps: 50
   toxin_decay_steps: 80
   random_seed: 42
+
+model:
+  observation_radius: 2
+  hidden: 128
 
 agents:
   per_env: 32

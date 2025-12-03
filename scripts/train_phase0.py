@@ -54,71 +54,31 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-
-    # 1. 读取用户配置 + 默认配置
     config = load_config(args.config)
-    default_config = load_config("config/default.yaml")
+    set_seed(config.get("world", {}).get("random_seed", 0))
 
-    # ---- world / 随机种子：config > default_config > 0 ----
-    world_cfg = config.get("world", {})
-    default_world_cfg = default_config.get("world", {})
-    random_seed = world_cfg.get(
-        "random_seed",
-        default_world_cfg.get("random_seed", 0),
-    )
-    set_seed(random_seed)
-
-    # 2. 构建环境和策略
     env = ProtoLifeEnv(config)
-    policy = build_policy(config).to(env.device)
+    policy = build_policy(config, obs_dim=env.observation_dim).to(env.device)
+    optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
 
-    # ---- training 配置：config.training 优先，其次 default.training，最后硬编码 ----
-    training_cfg = config.get("training", {})
-    default_training_cfg = default_config.get("training", {})
+    logger = None
+    if config.get("logging", {}).get("save_dir"):
+        from protolife.logger import ExperimentLogger
 
-    lr = training_cfg.get("lr", default_training_cfg.get("lr", 1e-3))
-    optimizer = torch.optim.Adam(policy.parameters(), lr=lr)
+        logger = ExperimentLogger(
+            save_dir=config["logging"].get("save_dir", "runs/default"),
+            snapshot_interval=config["logging"].get("snapshot_interval", 50),
+        )
 
     checkpoint_dir = Path(
         args.checkpoint_dir
-        or training_cfg.get(
-            "checkpoint_dir",
-            default_training_cfg.get("checkpoint_dir", "checkpoints"),
-        )
+        or config.get("training", {}).get("checkpoint_dir", "checkpoints")
     )
+    save_interval = args.save_interval or config.get("training", {}).get("save_interval", 100)
 
-    save_interval = args.save_interval or training_cfg.get(
-        "save_interval",
-        default_training_cfg.get("save_interval", 100),
-    )
-
-    rollout_steps = training_cfg.get(
-        "rollout_steps",
-        default_training_cfg.get("rollout_steps", 100),
-    )
-
-    gamma = training_cfg.get(
-        "gamma",
-        default_training_cfg.get("gamma", 0.99),
-    )
-
-    value_loss_coef = training_cfg.get(
-        "value_loss_coef",
-        default_training_cfg.get("value_loss_coef", 0.5),
-    )
-
-    debug_interval = training_cfg.get(
-        "debug_interval",
-        default_training_cfg.get("debug_interval", 512),
-    )
-
-    # 3. checkpoint / 初始化观测
     start_step = 0
     if args.resume_from:
-        env_state, policy_state, optim_state, meta = load_checkpoint(
-            Path(args.resume_from),
-            map_location=env.device,
-        )
+        env_state, policy_state, optim_state, meta = load_checkpoint(Path(args.resume_from), map_location=env.device)
         env.load_state(env_state)
         policy.load_state_dict(policy_state)
         if optim_state:
@@ -133,69 +93,32 @@ def main() -> None:
             policy.load_state_dict(state)
             print(f"仅加载模型参数：{args.load_model}")
 
-    # 4. Actor-Critic 训练循环（一步 TD）
+    flat_obs = obs["agent_obs"]
+    logits, values = policy(flat_obs)
+    actions = torch.distributions.Categorical(logits=logits).sample()
+
     total_steps = start_step
-
+    rollout_steps = config.get("training", {}).get("rollout_steps", 128)
     for step in range(rollout_steps):
-        # 4.1 当前观测 -> [batch, obs_dim]
-        obs_agents = obs["agents"].to(env.device)  # [num_envs, num_agents, obs_dim]
-        flat_obs = obs_agents.view(-1, obs_agents.shape[-1])
-
-        # 4.2 策略前向：logits + state value
-        logits, values = policy(flat_obs)  # values: [batch] 或 [batch, 1]
-
-        dist = torch.distributions.Categorical(logits=logits)
-        actions = dist.sample()                 # [batch]
-        log_probs = dist.log_prob(actions)      # [batch]
-
-        # 4.3 环境一步
         step_result = env.step(actions)
-        rewards = step_result.rewards.to(env.device).view(-1)  # [batch]
-
-        if debug_interval and (total_steps % debug_interval == 0):
-            print(
-                f"[debug] step={total_steps}, "
-                f"reward_mean={rewards.mean().item():.6f}"
-            )
-
-        # 4.4 计算 next_value（用于 advantage）
-        next_obs_agents = step_result.observations["agents"].to(env.device)
-        next_flat_obs = next_obs_agents.view(-1, next_obs_agents.shape[-1])
-        with torch.no_grad():
-            _, next_values = policy(next_flat_obs)  # [batch] 或 [batch, 1]
-
-        # 保证 values / next_values 为 [batch]
-        values = values.view(-1)
-        next_values = next_values.view(-1)
-
-        # 4.5 一步 advantage: A = r + gamma * V_next - V_now
-        advantage = rewards + gamma * next_values - values
-
-        # 4.6 策略损失 & 值函数损失
-        #     注意：advantage 只是用来加权 log_prob，不需要反向
-        policy_loss = -(advantage.detach() * log_probs).mean()
-        value_loss = 0.5 * advantage.pow(2).mean()
-        loss = policy_loss + value_loss_coef * value_loss
-
+        loss = -step_result.rewards.mean()
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        # 4.7 准备下一步
         obs = step_result.observations
+        flat_obs = obs["agent_obs"]
+        logits, values = policy(flat_obs)
+        actions = torch.distributions.Categorical(logits=logits).sample()
         total_steps += 1
 
-        # 4.8 checkpoint 保存
+        if logger:
+            logger.maybe_log(env.map_state, env.agent_batch.export_state())
+
         if total_steps % save_interval == 0:
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
-            torch.save(
-                policy.state_dict(),
-                checkpoint_dir / f"model_step_{total_steps}.pth",
-            )
-            torch.save(
-                optimizer.state_dict(),
-                checkpoint_dir / f"optim_step_{total_steps}.pth",
-            )
+            torch.save(policy.state_dict(), checkpoint_dir / f"model_step_{total_steps}.pth")
+            torch.save(optimizer.state_dict(), checkpoint_dir / f"optim_step_{total_steps}.pth")
             save_checkpoint(
                 checkpoint_dir / f"full_step_{total_steps}.pt",
                 env_state=env.export_state(),
