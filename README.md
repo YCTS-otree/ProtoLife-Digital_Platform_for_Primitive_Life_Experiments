@@ -40,16 +40,17 @@ maps/
 ```
 
 ## 快速开始（可直接运行的最小 Demo）
-> 当前仓库提供的是“可跑通流程”的最小原型：环境、策略与配置均为占位实现，但可以直接执行一轮前向推理与环境步进，用于验证依赖安装和配置是否正确。
+> 当前仓库提供的是“可跑通流程”的最小原型：环境、策略与配置均为占位实现或基本实现，但可以直接执行一轮前向推理与环境步进，用于验证依赖安装和配置是否正确。
 
 1. **准备 Python 环境**
    - 建议 Python 3.9+，可用 `python -m venv .venv && source .venv/bin/activate` 创建虚拟环境。
    - 安装依赖（CPU 版本示例）：`pip install torch pyyaml`。
    - 若需要 GPU/CUDA，请根据显卡与 CUDA 版本替换为官方给出的 `pip install torch==<ver>+cu118 -f https://download.pytorch.org/whl/torch_stable.html`。
 
-2. **运行占位 Demo**
+2. **运行基本 Demo**
+   tip:请在项目根目录运行
    ```bash
-   python scripts/train_phase0.py --config config/phase0_survival.yaml
+   python -m scripts.train_phase0 --config config/phase0_survival.yaml
    ```
    预期输出：
    - 打印观测张量的形状（map 与 agents）
@@ -79,13 +80,13 @@ maps/
    - 使用命令行编辑器快速制作地图：
      ```bash
      # 从空白 16x16 地图开始编辑，保存到 maps/custom_xxx.hex
-     python scripts/map_editor.py --width 16 --height 16
+     python -m scripts.map_editor --width 16 --height 16
 
      # 基于已有地图微调
-     python scripts/map_editor.py --input maps/default_map.hex --width 8 --height 8 --output maps/my_map.hex
+     python -m scripts.map_editor --input maps/default_map.hex --width 8 --height 8 --output maps/my_map.hex
 
      # 打开 matplotlib 图形界面，点击涂抹/按 n 切换笔刷类型
-     python scripts/map_editor.py --width 16 --height 16 --gui
+     python -m scripts.map_editor --width 16 --height 16 --gui
      ```
 
 6. **模型与环境 checkpoint / 断点续推**
@@ -97,10 +98,10 @@ maps/
    - 示例：
      ```bash
      # 带定期保存
-     python scripts/train_phase0.py --config config/phase0_survival.yaml --save-interval 50 --checkpoint-dir checkpoints/demo
+     python -m scripts.train_phase0 --config config/phase0_survival.yaml --save-interval 50 --checkpoint-dir checkpoints/demo
 
      # 从指定存档继续
-     python scripts/train_phase0.py --config config/phase0_survival.yaml --resume-from checkpoints/demo/full_step_200.pt
+     python -m scripts.train_phase0 --config config/phase0_survival.yaml --resume-from checkpoints/demo/full_step_200.pt
      ```
 
    - checkpoint 内容包括：当前地图、全部 agent 状态、策略网络参数、优化器参数与当前步数，可直接用于“继续推演”或模型回滚。
