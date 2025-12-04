@@ -19,36 +19,11 @@ from protolife.utils.seed_utils import set_seed
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="ProtoLife Phase0 训练")
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="config/phase0_survival.yaml",
-        help="配置文件路径",
-    )
-    parser.add_argument(
-        "--save-interval",
-        type=int,
-        default=None,
-        help="多少步保存一次模型/存档（覆盖 config.training.save_interval）",
-    )
-    parser.add_argument(
-        "--checkpoint-dir",
-        type=str,
-        default=None,
-        help="checkpoint 输出目录（覆盖 config.training.checkpoint_dir）",
-    )
-    parser.add_argument(
-        "--resume-from",
-        type=str,
-        default=None,
-        help="从完整 checkpoint 继续推演",
-    )
-    parser.add_argument(
-        "--load-model",
-        type=str,
-        default=None,
-        help="仅加载模型权重",
-    )
+    parser.add_argument("--config", type=str, default="config/phase0_survival.yaml", help="配置文件路径")
+    parser.add_argument("--save-interval", type=int, default=None, help="多少步保存一次模型/存档")
+    parser.add_argument("--checkpoint-dir", type=str, default=None, help="checkpoint 输出目录")
+    parser.add_argument("--resume-from", type=str, default=None, help="从完整 checkpoint 继续推演")
+    parser.add_argument("--load-model", type=str, default=None, help="仅加载模型权重")
     return parser.parse_args()
 
 

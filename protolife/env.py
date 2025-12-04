@@ -100,8 +100,9 @@ class ProtoLifeEnv:
         后续可逐步填充能量代谢、食物/毒素交互、战斗等细节。
         """
 
-        move_info = self.agent_batch.apply_actions(actions, self.height, self.width, self.map_state)
-        base_rewards = self.action_rewards[actions]
+        actions_2d = actions.view(self.agent_batch.num_envs, self.agent_batch.agents_per_env)
+        move_info = self.agent_batch.apply_actions(actions_2d, self.height, self.width, self.map_state)
+        base_rewards = self.action_rewards[actions_2d]
 
         rewards = base_rewards.view(self.agent_batch.num_envs, self.agent_batch.agents_per_env)
         rewards = rewards.clone()
@@ -118,12 +119,12 @@ class ProtoLifeEnv:
         rewards = torch.where(move_info["collided"], rewards - 0.02, rewards)
 
         # 交互：食物/毒素
-        env_ids = torch.arange(self.agent_batch.num_envs, device=self.device).unsqueeze(1).expand_as(actions)
+        env_ids = torch.arange(self.agent_batch.num_envs, device=self.device).unsqueeze(1).expand_as(actions_2d)
         x = self.agent_batch.state["x"]
         y = self.agent_batch.state["y"]
         current_cells = self.map_state[env_ids, y, x]
 
-        eat_mask = actions.view_as(x) == 5
+        eat_mask = actions_2d == 5
         food_mask = (current_cells & BIT_FOOD).bool()
         eat_success = eat_mask & food_mask
         rewards = torch.where(eat_success, rewards + 1.0, rewards)
