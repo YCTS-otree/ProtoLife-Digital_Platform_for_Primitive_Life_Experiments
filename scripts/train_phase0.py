@@ -68,23 +68,27 @@ def main() -> None:
             policy.load_state_dict(state)
             print(f"仅加载模型参数：{args.load_model}")
 
-    flat_obs = obs["agent_obs"]
-    logits, values = policy(flat_obs)
-    actions = torch.distributions.Categorical(logits=logits).sample()
-
     total_steps = start_step
     rollout_steps = config.get("training", {}).get("rollout_steps", 128)
     for step in range(rollout_steps):
+        flat_obs = obs["agent_obs"]
+        logits, values = policy(flat_obs)
+        dist = torch.distributions.Categorical(logits=logits)
+        actions = dist.sample()
+
         step_result = env.step(actions)
-        loss = -step_result.rewards.mean()
+        rewards = step_result.rewards
+
+        log_probs = dist.log_prob(actions)
+        policy_loss = -(rewards.detach() * log_probs).mean()
+        value_loss = 0.5 * ((values.squeeze(-1) - rewards.detach()) ** 2).mean()
+        loss = policy_loss + value_loss
+
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
         obs = step_result.observations
-        flat_obs = obs["agent_obs"]
-        logits, values = policy(flat_obs)
-        actions = torch.distributions.Categorical(logits=logits).sample()
         total_steps += 1
 
         if logger:
