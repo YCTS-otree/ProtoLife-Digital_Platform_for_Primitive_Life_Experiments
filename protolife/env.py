@@ -54,6 +54,11 @@ ENV_DEFAULTS = {
         "toxin_health": -5.0,
         "failed_eat_penalty": -0.05,
         "toxin_eat_penalty": -0.2,
+        "enable_proximity_reward": True,
+        "see_food_reward": 0.005,
+        "stand_on_food_reward": 0.02,
+        "vision_decay_mode": "linear",
+        "vision_decay_coefficient": 1.0,
     },
 }
 
@@ -163,6 +168,59 @@ class ProtoLifeEnv:
         x = self.agent_batch.state["x"]
         y = self.agent_batch.state["y"]
         current_cells = self.map_state[env_ids, y, x]
+
+        if self._get("rewards", "enable_proximity_reward", ENV_DEFAULTS["rewards"]["enable_proximity_reward"]):
+            radius = self.observation_radius
+            if radius > 0:
+                padded = F.pad(self.map_state.float().unsqueeze(1), (radius, radius, radius, radius))
+                kernel = 2 * radius + 1
+                patches = F.unfold(padded, kernel_size=kernel)  # (E, K, H*W)
+                flat_idx = y * self.width + x
+                gather_idx = flat_idx.unsqueeze(1).expand(-1, kernel * kernel, -1)
+                gathered = patches.gather(2, gather_idx).long()  # (E, K, A)
+                food_patch = (gathered & BIT_FOOD).bool()
+
+                offsets = torch.arange(-radius, radius + 1, device=self.device)
+                dy, dx = torch.meshgrid(offsets, offsets, indexing="ij")
+                distances = torch.sqrt(dx.float() ** 2 + dy.float() ** 2).view(1, -1, 1)
+                distances = distances.expand(self.agent_batch.num_envs, -1, self.agent_batch.agents_per_env)
+
+                food_distances = torch.where(
+                    food_patch,
+                    distances,
+                    torch.full_like(distances, float("inf")),
+                )
+                min_distances, _ = food_distances.min(dim=1)
+                food_found = torch.isfinite(min_distances) & (min_distances <= radius)
+                valid_distances = torch.where(food_found, min_distances, torch.zeros_like(min_distances))
+
+                decay_mode = self._get(
+                    "rewards", "vision_decay_mode", ENV_DEFAULTS["rewards"]["vision_decay_mode"]
+                ).lower()
+                decay_coeff = self._get(
+                    "rewards",
+                    "vision_decay_coefficient",
+                    ENV_DEFAULTS["rewards"]["vision_decay_coefficient"],
+                )
+                if decay_mode == "log":
+                    decay_scale = 1.0 / (1.0 + decay_coeff * torch.log1p(valid_distances))
+                else:
+                    decay_scale = torch.clamp(
+                        1.0 - decay_coeff * (valid_distances / max(radius, 1)), min=0.0
+                    )
+
+                see_reward = self._get(
+                    "rewards", "see_food_reward", ENV_DEFAULTS["rewards"]["see_food_reward"]
+                )
+                stand_on_reward = self._get(
+                    "rewards", "stand_on_food_reward", ENV_DEFAULTS["rewards"]["stand_on_food_reward"]
+                )
+                proximity_bonus = see_reward * decay_scale
+                stand_on_mask = (current_cells & BIT_FOOD).bool()
+                proximity_bonus = torch.where(
+                    stand_on_mask, stand_on_reward * decay_scale, proximity_bonus
+                )
+                rewards = rewards + torch.where(food_found, proximity_bonus, torch.zeros_like(rewards))
 
         eat_mask = actions_2d == 5
         food_mask = (current_cells & BIT_FOOD).bool()
