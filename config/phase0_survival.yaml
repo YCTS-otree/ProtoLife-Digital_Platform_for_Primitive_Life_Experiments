@@ -1,0 +1,10 @@
+# 仅验证基本生存，关闭复杂机制
+features:
+  use_reproduction: false
+  use_combat: false
+  use_communication: false
+  use_terraforming: false
+
+action_rewards:
+  MOVE: 0.02
+  REPRODUCE: 0.0
