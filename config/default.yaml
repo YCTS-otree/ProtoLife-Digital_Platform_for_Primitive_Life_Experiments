@@ -1,0 +1,61 @@
+# 世界设置：尺寸、可选地图、资源密度、随机种子
+world:
+  height: 64  # 地图高度
+  width: 64   # 地图宽度
+  map_file: null  # 自定义地图文件路径，null 表示随机生成
+  food_density: 0.03  # 初始食物密度
+  toxin_density: 0.01  # 初始毒素密度
+  food_respawn_steps: 50  # 食物补给的步间隔（预留，当前未使用）
+  toxin_decay_steps: 80   # 毒素衰减步数（预留，当前未使用）
+  random_seed: 42  # 随机种子，方便复现
+
+# 模型结构参数
+model:
+  observation_radius: 2  # 每个体可见半径 r
+  hidden: 128  # 策略网络隐藏层宽度
+
+# 个体初始与代谢参数
+agents:
+  per_env: 32  # 每个环境中的个体数
+  base_energy: 50  # 初始能量
+  base_health: 100  # 初始健康
+  base_metabolism_cost: 1.0  # 每步基础代谢消耗
+  move_cost: 0.2  # 移动额外能量消耗
+  communication_cost: 0.1  # 通信能量消耗（预留）
+  reproduction_energy_threshold: 80  # 繁衍能量阈值
+  child_energy_fraction: 0.3  # 子代获得的亲代能量比例
+
+# 训练超参与调试开关
+training:
+  num_envs: 32  # 并行环境数量
+  rollout_steps: 128  # 单次收集的步数
+  gamma: 0.99  # 折扣因子
+  gae_lambda: 0.95  # GAE 参数
+  ppo_clip: 0.2  # PPO clip 系数（预留）
+  save_interval: 100  # 模型/存档保存间隔
+  checkpoint_dir: checkpoints  # checkpoint 输出目录
+  print_actions: false  # 是否打印每步动作，便于调试
+
+# 功能开关
+features:
+  use_reproduction: true  # 是否启用繁衍机制
+  use_combat: true  # 是否启用战斗
+  use_communication: true  # 是否启用通信
+  use_terraforming: true  # 是否启用环境改造
+
+# 日志与可视化设置
+logging:
+  snapshot_interval: 50  # 记录快照的步间隔
+  realtime_render: false  # 是否开启实时渲染
+  save_dir: runs/default  # 日志目录
+  env_index: 0  # 多环境时选择写入第几个环境的快照
+
+# 动作基础奖励表
+action_rewards:
+  MOVE: 0.01
+  EAT: 0.0
+  ATTACK: 0.0
+  COMMUNICATE: 0.0
+  BUILD: 0.0
+  REMOVE: 0.0
+  REPRODUCE: 0.1
