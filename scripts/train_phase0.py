@@ -62,6 +62,7 @@ def main() -> None:
         logger = ExperimentLogger(
             save_dir=get_cfg(config, default_config, "logging", "save_dir", "runs/default"),
             snapshot_interval=get_cfg(config, default_config, "logging", "snapshot_interval", 50),
+            env_index=get_cfg(config, default_config, "logging", "env_index", 0),
         )
 
     checkpoint_dir = Path(

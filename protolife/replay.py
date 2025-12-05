@@ -41,8 +41,12 @@ def playback(log_dir: str, height: int, width: int, interval: float = 0.2) -> No
     fig, ax = plt.subplots()
     img = None
 
+    expected_bytes = height * width
+
     for map_line, agent_line in zip(map_iter, agent_iter):
-        grid = decode_grid(map_line, torch.Size((1, height, width)))[0]
+        # map.log 可能包含多个环境的拼接，这里只取第一个环境以匹配可视化窗口大小
+        trimmed_line = map_line[: expected_bytes * 2]
+        grid = decode_grid(trimmed_line, torch.Size((1, height, width)))[0]
         agent_data = json.loads(agent_line)
         agent_state = torch.tensor(agent_data["agents"], dtype=torch.float32)
         display = torch.zeros((height, width))
@@ -54,7 +58,8 @@ def playback(log_dir: str, height: int, width: int, interval: float = 0.2) -> No
             img = ax.imshow(display, cmap="viridis", vmin=0, vmax=1)
         else:
             img.set_data(display)
-        ax.collections.clear()
+        for artist in list(ax.collections):
+            artist.remove()
         xs = agent_state[..., 0].view(-1)
         ys = agent_state[..., 1].view(-1)
         ax.scatter(xs, ys, c="red", s=10)

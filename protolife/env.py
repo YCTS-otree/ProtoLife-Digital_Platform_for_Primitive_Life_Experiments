@@ -176,7 +176,9 @@ class ProtoLifeEnv:
         agent_state = self.agent_batch.export_state()
         local_maps = self._extract_local_observation()
         agent_features = self._normalize_agent_features(agent_state)
-        flat_local = local_maps.view(self.agent_batch.num_envs * self.agent_batch.agents_per_env, -1)
+        flat_local = local_maps.contiguous().view(
+            self.agent_batch.num_envs * self.agent_batch.agents_per_env, -1
+        )
         flat_agent = agent_features.view(self.agent_batch.num_envs * self.agent_batch.agents_per_env, -1)
         agent_obs = torch.cat([flat_local, flat_agent], dim=-1)
 
@@ -253,20 +255,25 @@ class ProtoLifeEnv:
         """裁剪每个体周围 r 范围内的网格并转为 multi-hot 通道。"""
 
         radius = self.observation_radius
-        padded = F.pad(self.map_state, (radius, radius, radius, radius))
-        patches: List[torch.Tensor] = []
-        for env_idx in range(self.agent_batch.num_envs):
-            env_grid = padded[env_idx]
-            for agent_idx in range(self.agent_batch.agents_per_env):
-                x = int(self.agent_batch.state["x"][env_idx, agent_idx].item()) + radius
-                y = int(self.agent_batch.state["y"][env_idx, agent_idx].item()) + radius
-                patch = env_grid[y - radius : y + radius + 1, x - radius : x + radius + 1]
-                channel_patch = self._cell_to_channels(patch)
-                patches.append(channel_patch)
-        return torch.stack(patches, dim=0)
+        # 将地图留在 GPU 上，通过 unfold + gather 一次性提取每个个体的局部区域，避免 CPU<->GPU 往返
+        padded = F.pad(self.map_state.unsqueeze(1), (radius, radius, radius, radius))  # (E,1,H+2r,W+2r)
+        kernel = 2 * radius + 1
+        patches = F.unfold(padded, kernel_size=kernel)  # (E, kernel*kernel, H*W)
+        flat_idx = self.agent_batch.state["y"] * self.width + self.agent_batch.state["x"]  # (E, A)
+        gather_idx = flat_idx.unsqueeze(1).expand(-1, kernel * kernel, -1)
+        gathered = patches.gather(2, gather_idx)  # (E, K, A)
+        gathered = gathered.permute(0, 2, 1)  # (E, A, K)
+        channel_tensor = self._cell_to_channels(gathered)
+        return channel_tensor
 
     def _cell_to_channels(self, patch: torch.Tensor) -> torch.Tensor:
-        """将单通道 bit map 转为 multi-hot 通道。"""
+        """将单通道 bit map 转为 multi-hot 通道。
+
+        支持输入形状：
+        - `(H, W)` 或 `(K,)` 一维 patch
+        - `(E, A, K)` 展开后的小块集合
+        输出形状与输入一致，末尾附加 channel 维度。
+        """
 
         channels = [
             (patch & BIT_TERRAIN_0) > 0,
@@ -275,7 +282,8 @@ class ProtoLifeEnv:
             (patch & BIT_TOXIN) > 0,
             (patch & BIT_RESOURCE) > 0,
         ]
-        return torch.stack([c.float() for c in channels], dim=-1)
+        stacked = torch.stack([c.float() for c in channels], dim=-1)
+        return stacked
 
     def _normalize_agent_features(self, agent_state: torch.Tensor) -> torch.Tensor:
         """归一化坐标/能量/健康，避免数值尺度差异。"""
@@ -328,7 +336,8 @@ class GridRenderer:
             self.img = self.ax.imshow(display, cmap="viridis", vmin=0, vmax=1)
         else:
             self.img.set_data(display)
-        self.ax.collections.clear()
+        for artist in list(self.ax.collections):
+            artist.remove()
         xs = agent_state["x"][0].cpu()
         ys = agent_state["y"][0].cpu()
         self.ax.scatter(xs, ys, c="red", s=10)
