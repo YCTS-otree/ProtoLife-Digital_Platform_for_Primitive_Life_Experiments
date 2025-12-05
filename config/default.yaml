@@ -76,3 +76,8 @@ rewards:
   toxin_health: -2.0      # 毒物对健康扣减
   failed_eat_penalty: -0.1  # 使用 EAT 但当前格没有食物的惩罚
   toxin_eat_penalty: -0.4    # 在毒物格执行 EAT 额外惩罚
+  enable_proximity_reward: true  # 是否启用视野内食物距离奖励
+  see_food_reward: 0.005          # 视野中发现食物的基础奖励（距离衰减前）
+  stand_on_food_reward: 0.02      # 踩在食物格上的基础奖励
+  vision_decay_mode: linear       # 距离衰减模式：linear 或 log
+  vision_decay_coefficient: 1.0   # 距离衰减系数（随距离增大奖励降低）

@@ -67,6 +67,11 @@ maps/
      可用 `entropy_coef` 调整策略熵正则（默认提供非零值防止动作过早塌缩），`action_noise` 下的 `gaussian_std` 与 `epsilon` 分别控制 logits 高斯噪声和 epsilon-greedy 随机探索。
      若需要调试模型的动作采样，可开启 `print_actions: true` 查看每步动作编号与含义。
    - `action_rewards`：行为基础奖励，可为正/负（示例：`MOVE: 0.01`, `ATTACK: -0.01`）。
+   - `rewards`：生存/进食奖励与食物感知奖励开关。
+     - `enable_proximity_reward`：是否根据感知范围内最近食物给予距离衰减奖励（默认开启）。
+     - `see_food_reward` / `stand_on_food_reward`：看到食物/踩在食物格时的基础奖励（默认 `0.005` / `0.02`）。
+     - `vision_decay_mode` 与 `vision_decay_coefficient`：控制距离衰减；`linear` 模式在半径处衰减到 `max(0, 1 - coeff)`，`log` 模式使用 `1 / (1 + coeff * log(1+d))` 更平滑。
+       例如感知半径为 3、`coeff=1.0` 时，线性衰减在距离 3 处约为 `0`，而对数衰减在距离 3 处仍保留约三分之一的奖励。
    - 阶段开关：各阶段配置文件通过布尔开关控制功能模块，例如 `use_reproduction`、`use_combat`、`use_communication`、`use_terraforming`。
 
    **如何自定义**：
