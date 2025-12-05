@@ -47,7 +47,8 @@ maps/
    - 安装依赖（CPU 版本示例）：`pip install torch pyyaml`。
    - 若需要 GPU/CUDA，请根据显卡与 CUDA 版本替换为官方给出的 `pip install torch==<ver>+cu118 -f https://download.pytorch.org/whl/torch_stable.html`。
 
-2. **运行占位 Demo**
+2. **运行基本 Demo**
+   tip:请在项目根目录运行
    ```bash
    python -m scripts.train_phase0 --config config/phase0_survival.yaml
    ```
