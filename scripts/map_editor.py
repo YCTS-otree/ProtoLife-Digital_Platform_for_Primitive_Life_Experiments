@@ -155,7 +155,8 @@ def fill_polygon_on_grid(grid: torch.Tensor, vertices: list[tuple[int, int]], va
     )
     points = torch.stack([xs.reshape(-1), ys.reshape(-1)], dim=1).numpy()
     polygon = MplPath(np.array(vertices, dtype=np.float32))
-    mask = polygon.contains_points(points, radius=1e-9).reshape(h, w)
+    mask_np = polygon.contains_points(points, radius=0.5).reshape(h, w)
+    mask = torch.from_numpy(mask_np).to(grid.device)
     grid[mask] = value
     # 确保顶点在结果中
     for x, y in vertices:
