@@ -256,13 +256,15 @@ class ProtoLifeEnv:
 
         radius = self.observation_radius
         # 将地图留在 GPU 上，通过 unfold + gather 一次性提取每个个体的局部区域，避免 CPU<->GPU 往返
-        padded = F.pad(self.map_state.unsqueeze(1), (radius, radius, radius, radius))  # (E,1,H+2r,W+2r)
+        padded = F.pad(
+            self.map_state.float().unsqueeze(1), (radius, radius, radius, radius)
+        )  # (E,1,H+2r,W+2r)
         kernel = 2 * radius + 1
         patches = F.unfold(padded, kernel_size=kernel)  # (E, kernel*kernel, H*W)
         flat_idx = self.agent_batch.state["y"] * self.width + self.agent_batch.state["x"]  # (E, A)
         gather_idx = flat_idx.unsqueeze(1).expand(-1, kernel * kernel, -1)
         gathered = patches.gather(2, gather_idx)  # (E, K, A)
-        gathered = gathered.permute(0, 2, 1)  # (E, A, K)
+        gathered = gathered.round().long().permute(0, 2, 1)  # (E, A, K)
         channel_tensor = self._cell_to_channels(gathered)
         return channel_tensor
 

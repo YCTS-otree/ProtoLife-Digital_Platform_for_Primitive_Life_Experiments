@@ -117,6 +117,9 @@ def main() -> None:
         obs = step_result.observations
         total_steps += 1
 
+        if total_steps % 16 == 0:
+            print(f"steps:{total_steps}  rewards:{rewards}")
+
         if logger:
             logger.maybe_log(env.map_state, env.agent_batch.export_state())
 

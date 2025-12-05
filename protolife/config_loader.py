@@ -16,8 +16,18 @@ def _read_yaml(path: Path) -> Dict:
 
     if not path.exists():
         return {}
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+    text = path.read_text(encoding="utf-8")
+    try:
+        return yaml.safe_load(text) or {}
+    except yaml.YAMLError as exc:
+        # 常见于 Windows 配置中直接写入 "C:\path\file" 导致反斜杠未转义。
+        escaped = text.replace("\\", "\\\\")
+        try:
+            return yaml.safe_load(escaped) or {}
+        except yaml.YAMLError:
+            raise ValueError(
+                f"无法解析 YAML: {path}. 如使用 Windows 路径请改用正斜杠或双反斜杠。"
+            ) from exc
 
 
 @lru_cache(maxsize=1)

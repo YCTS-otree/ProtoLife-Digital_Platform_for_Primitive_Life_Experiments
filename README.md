@@ -59,7 +59,8 @@ maps/
 
 3. **配置文件讲解与自定义**
    所有 YAML 位于 `config/`，推荐以 `config/default.yaml` 为基础：
-   - `world`：地图尺寸、随机地图中食物/毒素密度、随机种子、外部地图文件（示例：`height: 64`, `width: 64`, `map_file: maps/default_map.hex`）。如果提供了 `map_file` 且文件存在，会优先加载该地图，否则回退到随机/空白地图并按 `food_density`/`toxin_density` 撒点资源。 
+   - `world`：地图尺寸、随机地图中食物/毒素密度、随机种子、外部地图文件（示例：`height: 64`, `width: 64`, `map_file: maps/default_map.hex`）。如果提供了 `map_file` 且文件存在，会优先加载该地图，否则回退到随机/空白地图并按 `food_density`/`toxin_density` 撒点资源。
+     Windows 路径请使用正斜杠（例如 `G:/maps/demo.hex`）或在 YAML 中写成双反斜杠（`G:\\maps\\demo.hex`），避免未转义的反斜杠导致解析错误。
    - `agents`：每个环境的个体数量、初始能量等（示例：`per_env: 4`）。
    - `model`：`observation_radius` 控制感知范围（环境会裁剪周围 `(2r+1)^2` 的网格并拆成多通道输入），`hidden` 为 MLP 隐藏层规模。
    - `training`：并行环境数、回合步数、保存间隔等训练相关参数（示例：`num_envs: 8`, `save_interval: 100`, `checkpoint_dir: checkpoints/phase0`）。
