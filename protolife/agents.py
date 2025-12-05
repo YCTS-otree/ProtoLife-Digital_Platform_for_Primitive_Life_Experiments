@@ -68,21 +68,26 @@ class AgentBatch:
         dy = torch.where(actions == 1, -1, dy)  # 上
         dy = torch.where(actions == 2, 1, dy)  # 下
 
-        proposed_x = (self.state["x"] + dx).clamp(0, width - 1)
-        proposed_y = (self.state["y"] + dy).clamp(0, height - 1)
+        proposed_x = self.state["x"] + dx
+        proposed_y = self.state["y"] + dy
+
+        clamped_x = proposed_x.clamp(0, width - 1)
+        clamped_y = proposed_y.clamp(0, height - 1)
+        out_of_bounds = (proposed_x != clamped_x) | (proposed_y != clamped_y)
 
         env_ids = torch.arange(self.num_envs, device=self.device).unsqueeze(1).expand_as(actions)
-        wall_mask = (map_state[env_ids, proposed_y, proposed_x] & 1).bool()
+        wall_mask = (map_state[env_ids, clamped_y, clamped_x] & 1).bool()
+        collision_mask = wall_mask | out_of_bounds
 
-        new_x = torch.where(wall_mask, self.state["x"], proposed_x)
-        new_y = torch.where(wall_mask, self.state["y"], proposed_y)
+        new_x = torch.where(collision_mask, self.state["x"], clamped_x)
+        new_y = torch.where(collision_mask, self.state["y"], clamped_y)
         moved = (new_x != self.state["x"]) | (new_y != self.state["y"])
 
         self.state["x"] = new_x
         self.state["y"] = new_y
         self.state["age"] += 1
 
-        return {"moved": moved, "collided": wall_mask}
+        return {"moved": moved, "collided": collision_mask}
 
     def export_state(self) -> torch.Tensor:
         """打包状态为 `(E, A, D)` 张量，便于策略读取。"""
