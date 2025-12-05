@@ -1,7 +1,7 @@
 """Phase0 训练脚本占位。
 
 示例用法：
-    python scripts/train_phase0.py --config config/phase0_survival.yaml
+    python -m scripts.train_phase0 --config config/phase0_survival.yaml
 """
 from __future__ import annotations
 
@@ -13,8 +13,27 @@ import torch
 from protolife.config_loader import load_config
 from protolife.checkpoint import load_checkpoint, save_checkpoint
 from protolife.env import ProtoLifeEnv
-from protolife.policy import build_policy
+from protolife.policy import action_space, build_policy
 from protolife.utils.seed_utils import set_seed
+
+
+TRAIN_DEFAULTS = {
+    "world": {"random_seed": 0},
+    "training": {
+        "checkpoint_dir": "checkpoints",
+        "rollout_steps": 128,
+        "save_interval": 100,
+        "print_actions": False,
+    },
+    "logging": {"save_dir": "runs/default", "snapshot_interval": 50},
+}
+
+
+def get_cfg(config: dict, default_config: dict, section: str, key: str, fallback):
+    return config.get(section, {}).get(
+        key,
+        default_config.get(section, {}).get(key, TRAIN_DEFAULTS.get(section, {}).get(key, fallback)),
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -29,27 +48,28 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    config = load_config(args.config)
-    set_seed(config.get("world", {}).get("random_seed", 0))
+    config, default_config = load_config(args.config)
+    set_seed(get_cfg(config, default_config, "world", "random_seed", 0))
 
-    env = ProtoLifeEnv(config)
-    policy = build_policy(config, obs_dim=env.observation_dim).to(env.device)
+    env = ProtoLifeEnv(config, default_config)
+    policy = build_policy(config, default_config, obs_dim=env.observation_dim).to(env.device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
 
     logger = None
-    if config.get("logging", {}).get("save_dir"):
+    if get_cfg(config, default_config, "logging", "save_dir", None):
         from protolife.logger import ExperimentLogger
 
         logger = ExperimentLogger(
-            save_dir=config["logging"].get("save_dir", "runs/default"),
-            snapshot_interval=config["logging"].get("snapshot_interval", 50),
+            save_dir=get_cfg(config, default_config, "logging", "save_dir", "runs/default"),
+            snapshot_interval=get_cfg(config, default_config, "logging", "snapshot_interval", 50),
         )
 
     checkpoint_dir = Path(
         args.checkpoint_dir
-        or config.get("training", {}).get("checkpoint_dir", "checkpoints")
+        or get_cfg(config, default_config, "training", "checkpoint_dir", "checkpoints")
     )
-    save_interval = args.save_interval or config.get("training", {}).get("save_interval", 100)
+    save_interval = args.save_interval or get_cfg(config, default_config, "training", "save_interval", 100)
+    print_actions = get_cfg(config, default_config, "training", "print_actions", False)
 
     start_step = 0
     if args.resume_from:
@@ -69,12 +89,17 @@ def main() -> None:
             print(f"仅加载模型参数：{args.load_model}")
 
     total_steps = start_step
-    rollout_steps = config.get("training", {}).get("rollout_steps", 128)
+    rollout_steps = get_cfg(config, default_config, "training", "rollout_steps", 128)
     for step in range(rollout_steps):
         flat_obs = obs["agent_obs"]
         logits, values = policy(flat_obs)
         dist = torch.distributions.Categorical(logits=logits)
         actions = dist.sample()
+
+        if print_actions:
+            action_ids = actions.cpu().tolist()
+            names = [action_space.get(int(a), str(int(a))) for a in action_ids]
+            print(f"[step={total_steps}] actions: {action_ids} -> {names}")
 
         step_result = env.step(actions)
         rewards = step_result.rewards

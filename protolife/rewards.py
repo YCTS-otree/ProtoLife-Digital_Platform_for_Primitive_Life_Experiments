@@ -37,7 +37,11 @@ def build_action_reward_table(config_rewards: Dict[str, float]) -> torch.Tensor:
     rewards = BASE_ACTION_REWARD.copy()
     rewards.update(config_rewards)
     table = torch.zeros(len(ACTION_NAME_TO_INDEX), dtype=torch.float32)
+    move_alias = {"UP", "DOWN", "LEFT", "RIGHT"}
     for name, idx in ACTION_NAME_TO_INDEX.items():
+        if name in move_alias:
+            table[idx] = rewards.get("MOVE", BASE_ACTION_REWARD["MOVE"])
+            continue
         key = name if name in rewards else name.split("_")[0]
         table[idx] = rewards.get(key, 0.0)
     return table

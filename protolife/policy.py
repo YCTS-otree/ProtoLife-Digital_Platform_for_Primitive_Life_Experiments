@@ -22,6 +22,9 @@ action_space = {
 }
 
 
+POLICY_DEFAULTS = {"model": {"hidden": 128, "obs_dim": 5}}
+
+
 class MLPPolicy(nn.Module):
     """简化的多层感知机策略，方便后续替换为卷积/注意力结构。"""
 
@@ -43,9 +46,13 @@ class MLPPolicy(nn.Module):
         return self.policy_head(x), self.value_head(x)
 
 
-def build_policy(config: Dict, obs_dim: int | None = None) -> MLPPolicy:
+def build_policy(config: Dict, default_config: Dict, obs_dim: int | None = None) -> MLPPolicy:
     """根据配置构建策略网络。"""
 
-    hidden = config.get("model", {}).get("hidden", 128)
-    inferred_dim = obs_dim or config.get("model", {}).get("obs_dim", 5)
+    hidden = config.get("model", {}).get(
+        "hidden", default_config.get("model", {}).get("hidden", POLICY_DEFAULTS["model"]["hidden"])
+    )
+    inferred_dim = obs_dim or config.get("model", {}).get(
+        "obs_dim", default_config.get("model", {}).get("obs_dim", POLICY_DEFAULTS["model"]["obs_dim"])
+    )
     return MLPPolicy(obs_dim=inferred_dim, hidden_dim=hidden)

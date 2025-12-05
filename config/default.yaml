@@ -30,6 +30,7 @@ training:
   ppo_clip: 0.2
   save_interval: 100
   checkpoint_dir: checkpoints
+  print_actions: false
 
 features:
   use_reproduction: true

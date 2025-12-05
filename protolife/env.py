@@ -26,6 +26,21 @@ from .encoding import (
 from .rewards import build_action_reward_table
 
 
+ENV_DEFAULTS = {
+    "world": {"height": 64, "width": 64, "map_file": None, "food_density": 0.03, "toxin_density": 0.01},
+    "model": {"observation_radius": 2},
+    "agents": {
+        "per_env": 32,
+        "base_energy": 50,
+        "base_health": 100,
+        "base_metabolism_cost": 1.0,
+        "move_cost": 0.2,
+    },
+    "training": {"num_envs": 32, "rollout_steps": 128},
+    "logging": {"realtime_render": False},
+}
+
+
 @dataclass
 class EnvStepResult:
     """单步环境返回的结果容器。"""
@@ -45,19 +60,21 @@ class ProtoLifeEnv:
     - 为便于 GPU 并行，内部状态倾向使用 batched tensor。
     """
 
-    def __init__(self, config: Dict):
+    def __init__(self, config: Dict, default_config: Dict):
         self.config = config
+        self.default_config = default_config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.height = config.get("world", {}).get("height", 64)
-        self.width = config.get("world", {}).get("width", 64)
-        self.map_file = config.get("world", {}).get("map_file")
-        self.observation_radius = config.get("model", {}).get("observation_radius", 2)
-        self.food_density = config.get("world", {}).get("food_density", 0.02)
-        self.toxin_density = config.get("world", {}).get("toxin_density", 0.01)
-        self.action_rewards = build_action_reward_table(config.get("action_rewards", {}))
+        self.height = self._get("world", "height", ENV_DEFAULTS["world"]["height"])
+        self.width = self._get("world", "width", ENV_DEFAULTS["world"]["width"])
+        self.map_file = self._get("world", "map_file", ENV_DEFAULTS["world"].get("map_file"))
+        self.observation_radius = self._get("model", "observation_radius", ENV_DEFAULTS["model"]["observation_radius"])
+        self.food_density = self._get("world", "food_density", ENV_DEFAULTS["world"]["food_density"])
+        self.toxin_density = self._get("world", "toxin_density", ENV_DEFAULTS["world"]["toxin_density"])
+        action_reward_cfg = config.get("action_rewards", self.default_config.get("action_rewards", {}))
+        self.action_rewards = build_action_reward_table(action_reward_cfg)
         self.agent_batch = AgentBatch(
-            num_envs=config.get("training", {}).get("num_envs", 1),
-            agents_per_env=config.get("agents", {}).get("per_env", 1),
+            num_envs=self._get("training", "num_envs", ENV_DEFAULTS["training"]["num_envs"]),
+            agents_per_env=self._get("agents", "per_env", ENV_DEFAULTS["agents"]["per_env"]),
             device=self.device,
         )
         self._map_template = self._load_map_template().to(self.device)
@@ -65,7 +82,7 @@ class ProtoLifeEnv:
             (self.agent_batch.num_envs, self.height, self.width), dtype=torch.int64, device=self.device
         )
         self.renderer = None
-        if config.get("logging", {}).get("realtime_render", False):
+        if self._get("logging", "realtime_render", ENV_DEFAULTS["logging"]["realtime_render"]):
             self.renderer = GridRenderer(self.height, self.width)
 
         self.observation_dim = self._calculate_observation_dim()
@@ -85,8 +102,8 @@ class ProtoLifeEnv:
         self.agent_batch.reset(
             self.height,
             self.width,
-            base_energy=self.config.get("agents", {}).get("base_energy", 50),
-            base_health=self.config.get("agents", {}).get("base_health", 100),
+            base_energy=self._get("agents", "base_energy", ENV_DEFAULTS["agents"]["base_energy"]),
+            base_health=self._get("agents", "base_health", ENV_DEFAULTS["agents"]["base_health"]),
         )
         return self._build_observations()
 
@@ -110,8 +127,8 @@ class ProtoLifeEnv:
         health = self.agent_batch.state["health"]
 
         # 基础代谢与移动消耗
-        base_metabolism = self.config.get("agents", {}).get("base_metabolism_cost", 1.0)
-        move_cost = self.config.get("agents", {}).get("move_cost", 0.2)
+        base_metabolism = self._get("agents", "base_metabolism_cost", ENV_DEFAULTS["agents"]["base_metabolism_cost"])
+        move_cost = self._get("agents", "move_cost", ENV_DEFAULTS["agents"]["move_cost"])
         energy_cost = base_metabolism + move_cost * move_info["moved"].float()
         energy.sub_(energy_cost)
 
@@ -265,9 +282,9 @@ class ProtoLifeEnv:
 
         x = agent_state[..., 0] / max(self.width - 1, 1)
         y = agent_state[..., 1] / max(self.height - 1, 1)
-        energy = agent_state[..., 2] / max(self.config.get("agents", {}).get("base_energy", 50), 1)
-        health = agent_state[..., 3] / max(self.config.get("agents", {}).get("base_health", 100), 1)
-        age = agent_state[..., 4] / max(self.config.get("training", {}).get("rollout_steps", 128), 1)
+        energy = agent_state[..., 2] / max(self._get("agents", "base_energy", ENV_DEFAULTS["agents"]["base_energy"]), 1)
+        health = agent_state[..., 3] / max(self._get("agents", "base_health", ENV_DEFAULTS["agents"]["base_health"]), 1)
+        age = agent_state[..., 4] / max(self._get("training", "rollout_steps", ENV_DEFAULTS["training"]["rollout_steps"]), 1)
         return torch.stack([x, y, energy, health, age], dim=-1)
 
     def _calculate_observation_dim(self) -> int:
@@ -277,6 +294,12 @@ class ProtoLifeEnv:
         patch_channels = 5  # terrain/buildable/food/toxin/resource
         agent_feature_dim = 5
         return patch_cells * patch_channels + agent_feature_dim
+
+    def _get(self, section: str, key: str, fallback):
+        return self.config.get(section, {}).get(
+            key,
+            self.default_config.get(section, {}).get(key, ENV_DEFAULTS.get(section, {}).get(key, fallback)),
+        )
 
 
 class GridRenderer:

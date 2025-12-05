@@ -6,13 +6,10 @@ import argparse
 from datetime import datetime
 from pathlib import Path
 from typing import Dict
+import sys
 
 import torch
 import matplotlib.pyplot as plt
-
-import os
-import sys
-import torch
 
 # 确保可以从仓库根目录导入 protolife 包
 ROOT_DIR = Path(__file__).resolve().parents[1]

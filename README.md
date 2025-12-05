@@ -40,7 +40,7 @@ maps/
 ```
 
 ## 快速开始（可直接运行的最小 Demo）
-> 当前仓库提供的是“可跑通流程”的最小原型：环境、策略与配置均为占位实现或基本实现，但可以直接执行一轮前向推理与环境步进，用于验证依赖安装和配置是否正确。
+> 当前仓库提供的是“可跑通流程”的最小原型：环境、策略与配置均为占位实现，但可以直接执行一轮前向推理与环境步进，用于验证依赖安装和配置是否正确。
 
 1. **准备 Python 环境**
    - 建议 Python 3.9+，可用 `python -m venv .venv && source .venv/bin/activate` 创建虚拟环境。
@@ -63,13 +63,14 @@ maps/
    - `agents`：每个环境的个体数量、初始能量等（示例：`per_env: 4`）。
    - `model`：`observation_radius` 控制感知范围（环境会裁剪周围 `(2r+1)^2` 的网格并拆成多通道输入），`hidden` 为 MLP 隐藏层规模。
    - `training`：并行环境数、回合步数、保存间隔等训练相关参数（示例：`num_envs: 8`, `save_interval: 100`, `checkpoint_dir: checkpoints/phase0`）。
+     若需要调试模型的动作采样，可开启 `print_actions: true` 查看每步动作编号与含义。
    - `action_rewards`：行为基础奖励，可为正/负（示例：`MOVE: 0.01`, `ATTACK: -0.01`）。
    - 阶段开关：各阶段配置文件通过布尔开关控制功能模块，例如 `use_reproduction`、`use_combat`、`use_communication`、`use_terraforming`。
 
    **如何自定义**：
-   - 复制默认配置：`cp config/default.yaml config/my_exp.yaml`。
-   - 按需修改上述字段；未修改的字段会沿用默认值。
-   - 运行时指定：`python scripts/train_phase0.py --config config/my_exp.yaml`。
+    - 复制默认配置：`cp config/default.yaml config/my_exp.yaml`。
+    - 按需修改上述字段；未修改的字段会沿用默认值。
+    - 运行时指定：`python -m scripts.train_phase0 --config config/my_exp.yaml`。
 
 4. **常见问题排查**
    - `ModuleNotFoundError: No module named 'torch'`：确认已在当前虚拟环境中执行 `pip install torch pyyaml`。
@@ -108,6 +109,6 @@ maps/
 
 7. **实时渲染与回放**
    - `logging.realtime_render: true` 时，环境会用 matplotlib 绘制首个并行环境的地图与 agent 位置（参考 `map_editor` 的配色，需安装 matplotlib）。
-   - `logging.save_dir` 与 `logging.snapshot_interval` 控制回放日志写入；运行结束后可用 `protolife.replay.playback(log_dir, height, width)` 或脚本 `python scripts/visualize_replay.py --log-dir <dir> --height <H> --width <W>` 在 Python 交互式环境中快速查看轨迹。
+    - `logging.save_dir` 与 `logging.snapshot_interval` 控制回放日志写入；运行结束后可用 `protolife.replay.playback(log_dir, height, width)` 或脚本 `python -m scripts.visualize_replay --log-dir <dir> --height <H> --width <W>` 在 Python 交互式环境中快速查看轨迹。
 
 本 README 为概览，详细设计思路请参考源码中的中文注释，后续可在此基础上逐步补全能量代谢、战斗、通信等真实逻辑。
