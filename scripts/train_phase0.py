@@ -23,6 +23,8 @@ TRAIN_DEFAULTS = {
         "checkpoint_dir": "checkpoints",
         "rollout_steps": 128,
         "save_interval": 100,
+        "entropy_coef": 0.01,
+        "action_noise": {"gaussian_std": 0.0, "epsilon": 0.0},
         "print_actions": False,
     },
     "logging": {"save_dir": "runs/default", "snapshot_interval": 50},
@@ -71,6 +73,16 @@ def main() -> None:
     )
     save_interval = args.save_interval or get_cfg(config, default_config, "training", "save_interval", 100)
     print_actions = get_cfg(config, default_config, "training", "print_actions", False)
+    entropy_coef = get_cfg(config, default_config, "training", "entropy_coef", 0.01)
+
+    action_noise_cfg = (
+        config.get("training", {}).get("action_noise")
+        or default_config.get("training", {}).get("action_noise")
+        or TRAIN_DEFAULTS["training"].get("action_noise")
+        or {}
+    )
+    gaussian_noise_std = float(action_noise_cfg.get("gaussian_std", 0.0) or 0.0)
+    epsilon_greedy = float(action_noise_cfg.get("epsilon", 0.0) or 0.0)
 
     start_step = 0
     if args.resume_from:
@@ -94,8 +106,19 @@ def main() -> None:
     for step in range(rollout_steps):
         flat_obs = obs["agent_obs"]
         logits, values = policy(flat_obs)
+
+        if gaussian_noise_std > 0:
+            logits = logits + torch.randn_like(logits) * gaussian_noise_std
+
         dist = torch.distributions.Categorical(logits=logits)
         actions = dist.sample()
+
+        if epsilon_greedy > 0:
+            random_actions = torch.randint(
+                low=0, high=len(action_space), size=actions.shape, device=actions.device
+            )
+            greedy_mask = torch.rand(actions.shape, device=actions.device, dtype=torch.float32) < epsilon_greedy
+            actions = torch.where(greedy_mask, random_actions, actions)
 
         if print_actions:
             action_ids = actions.cpu().tolist()
@@ -106,9 +129,11 @@ def main() -> None:
         rewards = step_result.rewards
 
         log_probs = dist.log_prob(actions)
+        entropy = dist.entropy().mean()
         policy_loss = -(rewards.detach() * log_probs).mean()
         value_loss = 0.5 * ((values.squeeze(-1) - rewards.detach()) ** 2).mean()
-        loss = policy_loss + value_loss
+        entropy_loss = -entropy_coef * entropy
+        loss = policy_loss + value_loss + entropy_loss
 
         optimizer.zero_grad()
         loss.backward()

@@ -34,6 +34,10 @@ training:
   gamma: 0.99  # 折扣因子
   gae_lambda: 0.95  # GAE 参数
   ppo_clip: 0.2  # PPO clip 系数（预留）
+  entropy_coef: 0.01  # 策略熵权重，防止动作过早塌缩，设置为 0 可关闭
+  action_noise:  # 行动时额外注入的噪声配置
+    gaussian_std: 0.0  # 对 logits 添加的高斯噪声标准差
+    epsilon: 0.0  # 以 epsilon 概率使用均匀随机动作（epsilon-greedy）
   save_interval: 4096  # 模型/存档保存间隔
   checkpoint_dir: checkpoints  # checkpoint 输出目录
   print_actions: true  # 是否打印每步动作，便于调试
