@@ -47,7 +47,7 @@ ENV_DEFAULTS = {
     "training": {"num_envs": 32, "rollout_steps": 128},
     "logging": {"realtime_render": False},
     "rewards": {
-        "survival_reward": 0.001,
+        "survival_reward": 0.0001,
         "food_reward": 1.0,
         "food_energy": 10.0,
         "toxin_penalty": -0.5,
@@ -120,7 +120,6 @@ class ProtoLifeEnv:
             self.map_state = self._map_template.clone().expand(self.agent_batch.num_envs, -1, -1).contiguous()
         else:
             self.map_state = self._generate_random_map().to(self.device)
-        self._scatter_resources()
         self.step_count = 0
         self.agent_batch.reset(
             self.height,

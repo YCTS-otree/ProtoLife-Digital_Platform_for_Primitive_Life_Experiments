@@ -2,23 +2,23 @@
 world:
   height: 64  # 地图高度
   width: 64   # 地图宽度
-  map_file: null  # 自定义地图文件路径，null 表示随机生成
+  map_file: "maps/empty_64.hex"  # 自定义地图文件路径，null 表示随机生成
   food_density: 0.03  # 初始食物密度
   toxin_density: 0.01  # 初始毒素密度
-  food_respawn_interval: 0  # 每隔多少步重新撒一次食物，0 表示关闭
-  toxin_respawn_interval: 0  # 每隔多少步重新撒一次毒素，0 表示关闭
+  food_respawn_interval: 32  # 每隔多少步重新撒一次食物，0 表示关闭
+  toxin_respawn_interval: 512  # 每隔多少步重新撒一次毒素，0 表示关闭
   food_respawn_steps: 50  # 食物补给的步间隔（预留，当前未使用）
   toxin_decay_steps: 80   # 毒素衰减步数（预留，当前未使用）
   random_seed: 42  # 随机种子，方便复现
 
 # 模型结构参数
 model:
-  observation_radius: 2  # 每个体可见半径 r
-  hidden: 128  # 策略网络隐藏层宽度
+  observation_radius: 3  # 每个体可见半径 r
+  hidden: 16384  # 策略网络隐藏层宽度
 
 # 个体初始与代谢参数
 agents:
-  per_env: 1  # 每个环境中的个体数
+  per_env: 4  # 每个环境中的个体数
   base_energy: 50  # 初始能量
   base_health: 100  # 初始健康
   base_metabolism_cost: 0.1  # 每步基础代谢消耗
@@ -31,7 +31,7 @@ agents:
 training:
   num_envs: 1  # 并行环境数量
   rollout_steps: 32768  # 单次收集的步数
-  gamma: 0.99  # 折扣因子
+  gamma: 0.985  # 折扣因子
   gae_lambda: 0.95  # GAE 参数
   ppo_clip: 0.2  # PPO clip 系数（预留）
   entropy_coef: 0.01  # 策略熵权重，防止动作过早塌缩，设置为 0 可关闭
@@ -40,7 +40,7 @@ training:
     epsilon: 0.0  # 以 epsilon 概率使用均匀随机动作（epsilon-greedy）
   save_interval: 4096  # 模型/存档保存间隔
   checkpoint_dir: checkpoints  # checkpoint 输出目录
-  print_actions: true  # 是否打印每步动作，便于调试
+  print_actions: false  # 是否打印每步动作，便于调试
 
 # 功能开关
 features:
@@ -58,21 +58,21 @@ logging:
 
 # 动作基础奖励表
 action_rewards:
-  STAY: -0.01
+  STAY: -0.05
   MOVE: 0.01
-  EAT: 0.0
-  ATTACK: 0.0
-  COMMUNICATE: 0.0
-  BUILD: 0.0
-  REMOVE: 0.0
-  REPRODUCE: 0.1
+  EAT: 0.01
+  ATTACK: -0.05
+  COMMUNICATE: -0.05
+  BUILD: -0.05
+  REMOVE: -0.05
+  REPRODUCE: -0.05
 
 # 额外奖励/惩罚系数
 rewards:
   survival_reward: 0.001  # 每步活着获得的奖励
-  food_reward: 1.0        # 成功吃到食物奖励
+  food_reward: 0.5        # 成功吃到食物奖励
   food_energy: 10.0       # 吃到食物补充的能量
   toxin_penalty: -0.5     # 站在毒物格子的惩罚
-  toxin_health: -5.0      # 毒物对健康扣减
-  failed_eat_penalty: -0.05  # 使用 EAT 但当前格没有食物的惩罚
-  toxin_eat_penalty: -0.2    # 在毒物格执行 EAT 额外惩罚
+  toxin_health: -2.0      # 毒物对健康扣减
+  failed_eat_penalty: -0.1  # 使用 EAT 但当前格没有食物的惩罚
+  toxin_eat_penalty: -0.4    # 在毒物格执行 EAT 额外惩罚
