@@ -117,7 +117,7 @@ def main() -> None:
         obs = step_result.observations
         total_steps += 1
 
-        if total_steps % 16 == 0:
+        if total_steps % 128 == 0:
             print(f"steps:{total_steps}  rewards:{rewards}")
 
         if logger:
