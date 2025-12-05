@@ -71,7 +71,7 @@ class ProtoLifeEnv:
         self.food_density = self._get("world", "food_density", ENV_DEFAULTS["world"]["food_density"])
         self.toxin_density = self._get("world", "toxin_density", ENV_DEFAULTS["world"]["toxin_density"])
         action_reward_cfg = config.get("action_rewards", self.default_config.get("action_rewards", {}))
-        self.action_rewards = build_action_reward_table(action_reward_cfg)
+        self.action_rewards = build_action_reward_table(action_reward_cfg).to(self.device)
         self.agent_batch = AgentBatch(
             num_envs=self._get("training", "num_envs", ENV_DEFAULTS["training"]["num_envs"]),
             agents_per_env=self._get("agents", "per_env", ENV_DEFAULTS["agents"]["per_env"]),
