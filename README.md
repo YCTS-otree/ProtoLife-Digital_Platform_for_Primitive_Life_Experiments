@@ -64,6 +64,7 @@ maps/
    - `agents`：每个环境的个体数量、初始能量等（示例：`per_env: 4`）。
    - `model`：`observation_radius` 控制感知范围（环境会裁剪周围 `(2r+1)^2` 的网格并拆成多通道输入），`hidden` 为 MLP 隐藏层规模。
    - `training`：并行环境数、回合步数、保存间隔等训练相关参数（示例：`num_envs: 8`, `save_interval: 100`, `checkpoint_dir: checkpoints/phase0`）。
+     可用 `entropy_coef` 调整策略熵正则（默认提供非零值防止动作过早塌缩），`action_noise` 下的 `gaussian_std` 与 `epsilon` 分别控制 logits 高斯噪声和 epsilon-greedy 随机探索。
      若需要调试模型的动作采样，可开启 `print_actions: true` 查看每步动作编号与含义。
    - `action_rewards`：行为基础奖励，可为正/负（示例：`MOVE: 0.01`, `ATTACK: -0.01`）。
    - 阶段开关：各阶段配置文件通过布尔开关控制功能模块，例如 `use_reproduction`、`use_combat`、`use_communication`、`use_terraforming`。
