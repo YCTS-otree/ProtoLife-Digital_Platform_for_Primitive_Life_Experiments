@@ -98,7 +98,7 @@ class ProtoLifeEnv:
             self.map_state = self._map_template.clone().expand(self.agent_batch.num_envs, -1, -1).contiguous()
         else:
             self.map_state = self._generate_random_map().to(self.device)
-        self._scatter_resources()
+        #self._scatter_resources()#取消随机撒
         self.agent_batch.reset(
             self.height,
             self.width,
@@ -133,7 +133,7 @@ class ProtoLifeEnv:
         energy.sub_(energy_cost)
 
         # 撞墙轻微惩罚
-        rewards = torch.where(move_info["collided"], rewards - 0.02, rewards)
+        rewards = torch.where(move_info["collided"], rewards - 0.6, rewards)
 
         # 交互：食物/毒素
         env_ids = torch.arange(self.agent_batch.num_envs, device=self.device).unsqueeze(1).expand_as(actions_2d)
@@ -156,7 +156,10 @@ class ProtoLifeEnv:
         self.agent_batch.state["health"] = health
 
         # 生存奖励，鼓励活着
-        rewards += 0.001
+        rewards += 0.000001
+
+        # 生命值自然恢复
+        health += 0.05
 
         dones = (energy <= 0) | (health <= 0)
         infos: List[Dict] = [
