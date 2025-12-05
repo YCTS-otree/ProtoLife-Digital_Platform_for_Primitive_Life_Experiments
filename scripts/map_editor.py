@@ -208,6 +208,7 @@ def gui_edit(grid: torch.Tensor) -> torch.Tensor:
 
     current_type_names = list(CELL_TYPES.keys())
     current_idx = 0
+    drawing = False
 
     def render() -> None:
         display = torch.zeros_like(grid, dtype=torch.float32)
@@ -231,6 +232,14 @@ def gui_edit(grid: torch.Tensor) -> torch.Tensor:
             grid[y, x] = CELL_TYPES[current_type_names[current_idx]]
             render()
 
+    def ondrag(event) -> None:
+        if not drawing or not event.inaxes:
+            return
+        x, y = int(round(event.xdata)), int(round(event.ydata))
+        if 0 <= x < grid.shape[1] and 0 <= y < grid.shape[0]:
+            grid[y, x] = CELL_TYPES[current_type_names[current_idx]]
+            render()
+
     def onkey(event) -> None:
         nonlocal current_idx
         if event.key in {"n", "N", "tab"}:
@@ -239,12 +248,25 @@ def gui_edit(grid: torch.Tensor) -> torch.Tensor:
         if event.key in {"q", "escape"}:
             plt.close(fig)
 
+    def onpress(event) -> None:
+        nonlocal drawing
+        drawing = True
+        onclick(event)
+
+    def onrelease(event) -> None:
+        nonlocal drawing
+        drawing = False
+
     fig, ax = plt.subplots()
-    cid = fig.canvas.mpl_connect("button_press_event", onclick)
+    cid = fig.canvas.mpl_connect("button_press_event", onpress)
+    rid = fig.canvas.mpl_connect("button_release_event", onrelease)
+    mid = fig.canvas.mpl_connect("motion_notify_event", ondrag)
     kid = fig.canvas.mpl_connect("key_press_event", onkey)
     render()
     plt.show(block=True)
     fig.canvas.mpl_disconnect(cid)
+    fig.canvas.mpl_disconnect(rid)
+    fig.canvas.mpl_disconnect(mid)
     fig.canvas.mpl_disconnect(kid)
     return grid
 

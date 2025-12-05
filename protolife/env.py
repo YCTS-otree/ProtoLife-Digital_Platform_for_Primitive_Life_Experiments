@@ -27,7 +27,15 @@ from .rewards import build_action_reward_table
 
 
 ENV_DEFAULTS = {
-    "world": {"height": 64, "width": 64, "map_file": None, "food_density": 0.03, "toxin_density": 0.01},
+    "world": {
+        "height": 64,
+        "width": 64,
+        "map_file": None,
+        "food_density": 0.03,
+        "toxin_density": 0.01,
+        "food_respawn_interval": 0,
+        "toxin_respawn_interval": 0,
+    },
     "model": {"observation_radius": 2},
     "agents": {
         "per_env": 32,
@@ -38,6 +46,15 @@ ENV_DEFAULTS = {
     },
     "training": {"num_envs": 32, "rollout_steps": 128},
     "logging": {"realtime_render": False},
+    "rewards": {
+        "survival_reward": 0.001,
+        "food_reward": 1.0,
+        "food_energy": 10.0,
+        "toxin_penalty": -0.5,
+        "toxin_health": -5.0,
+        "failed_eat_penalty": -0.05,
+        "toxin_eat_penalty": -0.2,
+    },
 }
 
 
@@ -70,6 +87,10 @@ class ProtoLifeEnv:
         self.observation_radius = self._get("model", "observation_radius", ENV_DEFAULTS["model"]["observation_radius"])
         self.food_density = self._get("world", "food_density", ENV_DEFAULTS["world"]["food_density"])
         self.toxin_density = self._get("world", "toxin_density", ENV_DEFAULTS["world"]["toxin_density"])
+        self.food_respawn_interval = self._get("world", "food_respawn_interval", ENV_DEFAULTS["world"]["food_respawn_interval"])
+        self.toxin_respawn_interval = self._get(
+            "world", "toxin_respawn_interval", ENV_DEFAULTS["world"]["toxin_respawn_interval"]
+        )
         action_reward_cfg = config.get("action_rewards", self.default_config.get("action_rewards", {}))
         self.action_rewards = build_action_reward_table(action_reward_cfg).to(self.device)
         self.agent_batch = AgentBatch(
@@ -86,6 +107,7 @@ class ProtoLifeEnv:
             self.renderer = GridRenderer(self.height, self.width)
 
         self.observation_dim = self._calculate_observation_dim()
+        self.step_count = 0
 
     def reset(self) -> Dict[str, torch.Tensor]:
         """重置环境，返回初始观测。
@@ -98,7 +120,8 @@ class ProtoLifeEnv:
             self.map_state = self._map_template.clone().expand(self.agent_batch.num_envs, -1, -1).contiguous()
         else:
             self.map_state = self._generate_random_map().to(self.device)
-        #self._scatter_resources()#取消随机撒
+        self._scatter_resources()
+        self.step_count = 0
         self.agent_batch.reset(
             self.height,
             self.width,
@@ -118,6 +141,7 @@ class ProtoLifeEnv:
         """
 
         actions_2d = actions.view(self.agent_batch.num_envs, self.agent_batch.agents_per_env)
+        self.step_count += 1
         move_info = self.agent_batch.apply_actions(actions_2d, self.height, self.width, self.map_state)
         base_rewards = self.action_rewards[actions_2d]
 
@@ -144,22 +168,38 @@ class ProtoLifeEnv:
         eat_mask = actions_2d == 5
         food_mask = (current_cells & BIT_FOOD).bool()
         eat_success = eat_mask & food_mask
-        rewards = torch.where(eat_success, rewards + 1.0, rewards)
-        energy = torch.where(eat_success, energy + 10.0, energy)
+        failed_eat = eat_mask & (~food_mask)
+        rewards = torch.where(eat_success, rewards + self._get("rewards", "food_reward", ENV_DEFAULTS["rewards"]["food_reward"]), rewards)
+        rewards = torch.where(failed_eat, rewards + self._get("rewards", "failed_eat_penalty", ENV_DEFAULTS["rewards"]["failed_eat_penalty"]), rewards)
+        energy = torch.where(
+            eat_success,
+            energy + self._get("rewards", "food_energy", ENV_DEFAULTS["rewards"]["food_energy"]),
+            energy,
+        )
         self.map_state[env_ids, y, x] = torch.where(eat_success, current_cells & (~BIT_FOOD), current_cells)
 
         toxin_mask = (current_cells & BIT_TOXIN).bool()
-        rewards = torch.where(toxin_mask, rewards - 0.5, rewards)
-        health = torch.where(toxin_mask, health - 5.0, health)
+        eat_on_toxin = eat_mask & toxin_mask
+        rewards = torch.where(toxin_mask, rewards + self._get("rewards", "toxin_penalty", ENV_DEFAULTS["rewards"]["toxin_penalty"]), rewards)
+        rewards = torch.where(
+            eat_on_toxin,
+            rewards + self._get("rewards", "toxin_eat_penalty", ENV_DEFAULTS["rewards"]["toxin_eat_penalty"]),
+            rewards,
+        )
+        health = torch.where(
+            toxin_mask,
+            health + self._get("rewards", "toxin_health", ENV_DEFAULTS["rewards"]["toxin_health"]),
+            health,
+        )
 
         self.agent_batch.state["energy"] = energy
         self.agent_batch.state["health"] = health
 
         # 生存奖励，鼓励活着
-        rewards += 0.000001
+        rewards += self._get("rewards", "survival_reward", ENV_DEFAULTS["rewards"]["survival_reward"])
 
-        # 生命值自然恢复
-        health += 0.05
+        # 周期性刷新资源/毒素
+        self._maybe_respawn_resources()
 
         dones = (energy <= 0) | (health <= 0)
         infos: List[Dict] = [
@@ -242,17 +282,33 @@ class ProtoLifeEnv:
         grid[:, :, -1] |= BIT_TERRAIN_0
         return grid
 
-    def _scatter_resources(self) -> None:
+    def _scatter_resources(self, *, respawn: bool = False) -> None:
         """在地图上随机撒食物和毒素，便于快速获得奖励信号。"""
 
         if self.food_density <= 0 and self.toxin_density <= 0:
             return
 
-        food_mask = torch.rand((self.agent_batch.num_envs, self.height, self.width), device=self.device) < self.food_density
-        toxin_mask = torch.rand((self.agent_batch.num_envs, self.height, self.width), device=self.device) < self.toxin_density
-        self.map_state = self.map_state.clone()
+        food_density = self.food_density
+        toxin_density = self.toxin_density
+        food_mask = torch.rand((self.agent_batch.num_envs, self.height, self.width), device=self.device) < food_density
+        toxin_mask = torch.rand((self.agent_batch.num_envs, self.height, self.width), device=self.device) < toxin_density
+        # respawn 时避免覆盖墙体，只在可用格子叠加食物/毒素
+        if respawn:
+            wall_mask = (self.map_state & BIT_TERRAIN_0).bool()
+            food_mask = food_mask & (~wall_mask)
+            toxin_mask = toxin_mask & (~wall_mask)
         self.map_state = torch.where(food_mask, self.map_state | BIT_FOOD, self.map_state)
         self.map_state = torch.where(toxin_mask, self.map_state | BIT_TOXIN, self.map_state)
+
+    def _maybe_respawn_resources(self) -> None:
+        """根据配置周期性刷新食物/毒素。"""
+
+        if self.food_respawn_interval and self.food_respawn_interval > 0:
+            if self.step_count % self.food_respawn_interval == 0:
+                self._scatter_resources(respawn=True)
+        if self.toxin_respawn_interval and self.toxin_respawn_interval > 0:
+            if self.step_count % self.toxin_respawn_interval == 0:
+                self._scatter_resources(respawn=True)
 
     def _extract_local_observation(self) -> torch.Tensor:
         """裁剪每个体周围 r 范围内的网格并转为 multi-hot 通道。"""

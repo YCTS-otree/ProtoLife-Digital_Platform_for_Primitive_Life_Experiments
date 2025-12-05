@@ -1,26 +1,28 @@
 # 世界设置：尺寸、可选地图、资源密度、随机种子
 world:
-  height: 16  # 地图高度
-  width: 16   # 地图宽度
-  map_file: "G:/Python/Python/项目/Proto_Digital_Life/maps/custom_20251205_190435.hex"  # 自定义地图文件路径，null 表示随机生成
+  height: 64  # 地图高度
+  width: 64   # 地图宽度
+  map_file: null  # 自定义地图文件路径，null 表示随机生成
   food_density: 0.03  # 初始食物密度
   toxin_density: 0.01  # 初始毒素密度
+  food_respawn_interval: 0  # 每隔多少步重新撒一次食物，0 表示关闭
+  toxin_respawn_interval: 0  # 每隔多少步重新撒一次毒素，0 表示关闭
   food_respawn_steps: 50  # 食物补给的步间隔（预留，当前未使用）
   toxin_decay_steps: 80   # 毒素衰减步数（预留，当前未使用）
   random_seed: 42  # 随机种子，方便复现
 
 # 模型结构参数
 model:
-  observation_radius: 4  # 每个体可见半径 r
-  hidden: 12288  # 策略网络隐藏层宽度
+  observation_radius: 2  # 每个体可见半径 r
+  hidden: 128  # 策略网络隐藏层宽度
 
 # 个体初始与代谢参数
 agents:
   per_env: 1  # 每个环境中的个体数
   base_energy: 50  # 初始能量
   base_health: 100  # 初始健康
-  base_metabolism_cost: 0.0  # 每步基础代谢消耗
-  move_cost: 0.0  # 移动额外能量消耗
+  base_metabolism_cost: 0.1  # 每步基础代谢消耗
+  move_cost: 0.1  # 移动额外能量消耗
   communication_cost: 0.1  # 通信能量消耗（预留）
   reproduction_energy_threshold: 80  # 繁衍能量阈值
   child_energy_fraction: 0.3  # 子代获得的亲代能量比例
@@ -52,10 +54,21 @@ logging:
 
 # 动作基础奖励表
 action_rewards:
+  STAY: -0.01
   MOVE: 0.01
-  EAT: 0.02
+  EAT: 0.0
   ATTACK: 0.0
   COMMUNICATE: 0.0
   BUILD: 0.0
   REMOVE: 0.0
   REPRODUCE: 0.1
+
+# 额外奖励/惩罚系数
+rewards:
+  survival_reward: 0.001  # 每步活着获得的奖励
+  food_reward: 1.0        # 成功吃到食物奖励
+  food_energy: 10.0       # 吃到食物补充的能量
+  toxin_penalty: -0.5     # 站在毒物格子的惩罚
+  toxin_health: -5.0      # 毒物对健康扣减
+  failed_eat_penalty: -0.05  # 使用 EAT 但当前格没有食物的惩罚
+  toxin_eat_penalty: -0.2    # 在毒物格执行 EAT 额外惩罚
