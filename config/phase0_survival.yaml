@@ -6,5 +6,5 @@ features:
   use_terraforming: false
 
 action_rewards:
-  MOVE: 0.02
+  MOVE: 0.5
   REPRODUCE: 0.0

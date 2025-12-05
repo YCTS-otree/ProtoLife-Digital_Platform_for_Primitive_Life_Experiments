@@ -157,7 +157,7 @@ class ProtoLifeEnv:
         energy.sub_(energy_cost)
 
         # 撞墙轻微惩罚
-        rewards = torch.where(move_info["collided"], rewards - 0.02, rewards)
+        rewards = torch.where(move_info["collided"], rewards - 0.6, rewards)
 
         # 交互：食物/毒素
         env_ids = torch.arange(self.agent_batch.num_envs, device=self.device).unsqueeze(1).expand_as(actions_2d)
