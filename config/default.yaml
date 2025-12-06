@@ -41,6 +41,7 @@ training:
   save_interval: 4096  # 模型/存档保存间隔
   checkpoint_dir: checkpoints  # checkpoint 输出目录
   print_actions: false  # 是否打印每步动作，便于调试
+  print_interval: 128  # 进度打印间隔（步数）
 
 # 功能开关
 features:
