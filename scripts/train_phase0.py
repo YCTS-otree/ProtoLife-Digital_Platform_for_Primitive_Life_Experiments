@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import time
 from pathlib import Path
 
 import torch
@@ -26,6 +27,7 @@ TRAIN_DEFAULTS = {
         "entropy_coef": 0.01,
         "action_noise": {"gaussian_std": 0.0, "epsilon": 0.0},
         "print_actions": False,
+        "print_interval": 128,
     },
     "logging": {"save_dir": "runs/default", "snapshot_interval": 50},
 }
@@ -45,6 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-dir", type=str, default=None, help="checkpoint 输出目录")
     parser.add_argument("--resume-from", type=str, default=None, help="从完整 checkpoint 继续推演")
     parser.add_argument("--load-model", type=str, default=None, help="仅加载模型权重")
+    parser.add_argument("--print-interval", type=int, default=None, help="训练日志打印间隔")
     return parser.parse_args()
 
 
@@ -74,6 +77,9 @@ def main() -> None:
     save_interval = args.save_interval or get_cfg(config, default_config, "training", "save_interval", 100)
     print_actions = get_cfg(config, default_config, "training", "print_actions", False)
     entropy_coef = get_cfg(config, default_config, "training", "entropy_coef", 0.01)
+    print_interval = args.print_interval or get_cfg(
+        config, default_config, "training", "print_interval", TRAIN_DEFAULTS["training"]["print_interval"]
+    )
 
     action_noise_cfg = (
         config.get("training", {}).get("action_noise")
@@ -103,6 +109,8 @@ def main() -> None:
 
     total_steps = start_step
     rollout_steps = get_cfg(config, default_config, "training", "rollout_steps", 128)
+    last_print_time = time.perf_counter()
+    last_print_step = total_steps
     for step in range(rollout_steps):
         flat_obs = obs["agent_obs"]
         logits, values = policy(flat_obs)
@@ -142,8 +150,28 @@ def main() -> None:
         obs = step_result.observations
         total_steps += 1
 
-        if total_steps % 128 == 0:
-            print(f"steps:{total_steps}  rewards:{rewards}")
+        if print_interval > 0 and total_steps % print_interval == 0:
+            now = time.perf_counter()
+            step_delta = total_steps - last_print_step
+            time_delta = now - last_print_time
+            if time_delta > 0 and step_delta > 0:
+                steps_per_sec = step_delta / time_delta
+                if steps_per_sec >= 1:
+                    step_rate_text = f"{steps_per_sec:.2f} step/s"
+                else:
+                    step_rate_text = f"{(time_delta / step_delta):.2f} s/step"
+                agents_processed = step_delta * env.agent_batch.num_envs * env.agent_batch.agents_per_env
+                model_speed = agents_processed / time_delta
+                model_speed_text = f"{model_speed:.2f} agents/s"
+            else:
+                step_rate_text = "n/a"
+                model_speed_text = "n/a"
+
+            print(
+                f"steps:{total_steps}  rewards:{rewards}  step_rate:{step_rate_text}  model_speed:{model_speed_text}"
+            )
+            last_print_time = now
+            last_print_step = total_steps
 
         if logger:
             logger.maybe_log(env.map_state, env.agent_batch.export_state())
