@@ -45,7 +45,12 @@ def get_cfg(config: dict, default_config: dict, section: str, key: str, fallback
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="ProtoLife Phase0 训练")
-    parser.add_argument("--config", type=str, default="config/phase0_survival.yaml", help="配置文件路径")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="配置文件路径，不提供时会使用 model/<name>/<name>.yaml",
+    )
     parser.add_argument("--save-interval", type=int, default=None, help="多少步保存一次模型/存档")
     parser.add_argument("--checkpoint-dir", type=str, default=None, help="checkpoint 输出目录")
     parser.add_argument("--model-dir", type=str, default=None, help="模型目录，支持指向已有模型继续训练")
@@ -111,13 +116,18 @@ def _find_latest_full_checkpoint(checkpoint_dir: Path) -> Path | None:
 
 def main() -> None:
     args = parse_args()
-    config, default_config = load_config(args.config)
     run_tag = time.strftime("%Y%m%d_%H%M%S")
     model_dir, model_name = _prepare_model_dir(args, run_tag)
     log_dir = model_dir / "log"
     checkpoint_dir = model_dir / (args.checkpoint_dir or "checkpoint")
 
     model_config_path = model_dir / f"{model_name}.yaml"
+    if args.config:
+        config_path = Path(args.config)
+    else:
+        config_path = model_config_path
+
+    config, default_config = load_config(str(config_path))
     existing_model_config = {}
     if model_config_path.exists():
         existing_model_config = yaml.safe_load(model_config_path.read_text(encoding="utf-8")) or {}
@@ -125,6 +135,9 @@ def main() -> None:
     config = _merge_dict(existing_model_config, config)
     merged_config = _merge_dict(default_config, config)
     model_config_path.write_text(yaml.safe_dump(merged_config, allow_unicode=True), encoding="utf-8")
+    print(f"模型目录: {model_dir.resolve()}")
+    print(f"配置文件: {config_path.resolve()}")
+    print(f"Checkpoint 目录: {checkpoint_dir.resolve()}")
     set_seed(get_cfg(config, default_config, "world", "random_seed", 0))
 
     env = ProtoLifeEnv(config, default_config)
@@ -178,6 +191,7 @@ def main() -> None:
         checkpoint_path = latest_checkpoint
 
     if checkpoint_path:
+        print(f"使用的 checkpoint: {checkpoint_path.resolve()}")
         env_state, policy_state, optim_state, meta = load_checkpoint(checkpoint_path, map_location=env.device)
         env.load_state(env_state)
         policy.load_state_dict(policy_state)
@@ -187,6 +201,7 @@ def main() -> None:
         obs = env._build_observations()
         print(f"从 checkpoint 恢复，起始 step={start_step}，来源: {checkpoint_path}")
     else:
+        print("未找到现有 checkpoint，将从头开始训练。")
         obs = env.reset()
         if args.load_model:
             state = torch.load(args.load_model, map_location=env.device)
