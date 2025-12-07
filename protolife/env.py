@@ -93,11 +93,17 @@ class ProtoLifeEnv:
         self.observation_radius = self._get("model", "observation_radius", ENV_DEFAULTS["model"]["observation_radius"])
         self.food_density = self._get("world", "food_density", ENV_DEFAULTS["world"]["food_density"])
         self.toxin_density = self._get("world", "toxin_density", ENV_DEFAULTS["world"]["toxin_density"])
-        self.food_respawn_interval = self._get("world", "food_respawn_interval", ENV_DEFAULTS["world"]["food_respawn_interval"])
+        self.food_respawn_interval = self._get(
+            "world", "food_respawn_interval", ENV_DEFAULTS["world"]["food_respawn_interval"]
+        )
         self.toxin_respawn_interval = self._get(
             "world", "toxin_respawn_interval", ENV_DEFAULTS["world"]["toxin_respawn_interval"]
         )
-        self.toxin_lifetime = self._get("world", "toxin_lifetime", 0)
+        self.toxin_lifetime = self._get(
+            "world",
+            "toxin_lifetime",
+            self._get("world", "toxin_decay_steps", 0),
+        )
         action_reward_cfg = config.get("action_rewards", self.default_config.get("action_rewards", {}))
         self.action_rewards = build_action_reward_table(action_reward_cfg).to(self.device)
         self.agent_batch = AgentBatch(
@@ -352,25 +358,40 @@ class ProtoLifeEnv:
         grid[:, :, -1] |= BIT_TERRAIN_0
         return grid
 
-    def _scatter_resources(self, *, respawn: bool = False) -> None:
+    def _scatter_resources(self, *, spawn_food: bool = True, spawn_toxin: bool = True, respawn: bool = False) -> None:
         """在地图上随机撒食物和毒素，便于快速获得奖励信号。"""
 
-        if self.food_density <= 0 and self.toxin_density <= 0:
+        if (not spawn_food or self.food_density <= 0) and (not spawn_toxin or self.toxin_density <= 0):
             return
 
-        food_density = self.food_density
-        toxin_density = self.toxin_density
-        food_mask = torch.rand((self.agent_batch.num_envs, self.height, self.width), device=self.device) < food_density
-        toxin_mask = torch.rand((self.agent_batch.num_envs, self.height, self.width), device=self.device) < toxin_density
-        # respawn 时避免覆盖墙体，只在可用格子叠加食物/毒素
+        wall_mask = None
         if respawn:
             wall_mask = (self.map_state & BIT_TERRAIN_0).bool()
-            food_mask = food_mask & (~wall_mask)
-            toxin_mask = toxin_mask & (~wall_mask)
+
+        food_mask = None
+        if spawn_food and self.food_density > 0:
+            food_mask = (
+                torch.rand((self.agent_batch.num_envs, self.height, self.width), device=self.device)
+                < self.food_density
+            )
+            if wall_mask is not None:
+                food_mask = food_mask & (~wall_mask)
+
+        toxin_mask = None
+        if spawn_toxin and self.toxin_density > 0:
+            toxin_mask = (
+                torch.rand((self.agent_batch.num_envs, self.height, self.width), device=self.device)
+                < self.toxin_density
+            )
+            if wall_mask is not None:
+                toxin_mask = toxin_mask & (~wall_mask)
+
         existing_toxin = (self.map_state & BIT_TOXIN).bool()
-        self.map_state = torch.where(food_mask, self.map_state | BIT_FOOD, self.map_state)
-        self.map_state = torch.where(toxin_mask, self.map_state | BIT_TOXIN, self.map_state)
-        if self.toxin_lifetime:
+        if food_mask is not None:
+            self.map_state = torch.where(food_mask, self.map_state | BIT_FOOD, self.map_state)
+        if toxin_mask is not None:
+            self.map_state = torch.where(toxin_mask, self.map_state | BIT_TOXIN, self.map_state)
+        if toxin_mask is not None and self.toxin_lifetime:
             new_toxin_cells = toxin_mask & (~existing_toxin)
             self.toxin_age = torch.where(new_toxin_cells, torch.zeros_like(self.toxin_age), self.toxin_age)
 
@@ -386,10 +407,10 @@ class ProtoLifeEnv:
 
         if self.food_respawn_interval and self.food_respawn_interval > 0:
             if self.step_count % self.food_respawn_interval == 0:
-                self._scatter_resources(respawn=True)
+                self._scatter_resources(spawn_food=True, spawn_toxin=False, respawn=True)
         if self.toxin_respawn_interval and self.toxin_respawn_interval > 0:
             if self.step_count % self.toxin_respawn_interval == 0:
-                self._scatter_resources(respawn=True)
+                self._scatter_resources(spawn_food=False, spawn_toxin=True, respawn=True)
 
     def _decay_toxins(self) -> None:
         """当毒素存续超过寿命时将其从地图上移除。"""
