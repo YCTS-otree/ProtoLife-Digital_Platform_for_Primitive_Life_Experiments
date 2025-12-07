@@ -9,6 +9,15 @@ world:
   toxin_respawn_interval: 2  # 每隔多少步重新撒一次毒素，0 表示关闭
   toxin_lifetime: 2   # 毒素存续步数，超过后自动衰减
   random_seed: 42  # 随机种子，方便复现
+  resource_noise:  # 使用 Perlin Noise 生成更平滑的资源分布，可关闭回退到均匀随机
+    enabled: true
+    scale: 16.0       # 控制噪声纹理尺寸，值越大区域越大
+    octaves: 2        # 叠加的噪声层数，提升复杂度
+    persistence: 0.5  # 每层振幅衰减系数
+    lacunarity: 2.0   # 频率倍增系数
+    seed: 1234        # 噪声随机种子，null 表示使用 random_seed 或随机生成
+    food_bias: 0.05   # 对食物分布的额外偏移，可正可负
+    toxin_bias: -0.05 # 对毒物分布的额外偏移，可正可负
 
 # 模型结构参数
 model:
