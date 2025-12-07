@@ -7,8 +7,7 @@ world:
   toxin_density: 0.01  # 初始毒素密度
   food_respawn_interval: 0  # 每隔多少步重新撒一次食物，0 表示关闭
   toxin_respawn_interval: 2  # 每隔多少步重新撒一次毒素，0 表示关闭
-  food_respawn_steps: 50  # 食物补给的步间隔（预留，当前未使用）
-  toxin_decay_steps: 2   # 毒素衰减步数
+  toxin_lifetime: 2   # 毒素存续步数，超过后自动衰减
   random_seed: 42  # 随机种子，方便复现
 
 # 模型结构参数
