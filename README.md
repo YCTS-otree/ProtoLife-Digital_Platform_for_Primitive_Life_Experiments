@@ -11,32 +11,34 @@ ProtoLife 旨在验证在有限二维世界中构建具备代谢、感知、行�
 ## 目录结构
 ```
 config/
-  default.yaml              # 通用默认配置
-  phase0_survival.yaml      # 生存阶段示例
-  phase1_reproduction.yaml  # 繁衍阶段示例
-  phase2_combat.yaml        # 战斗阶段示例
-  phase3_communication.yaml # 通信阶段示例
-  phase4_terraforming.yaml  # 环境改造阶段示例
+  default.yaml                # 通用默认配置，可作为基底
+  phase0_survival.yaml        # 生存阶段示例（可复制到 model/<name>/<name>.yaml 使用）
+model/
+  demo_model/                 # 单个模型/实验的归档目录
+    demo_model.yaml           # 仅此一份主配置（建议由 config/ 复制后修改）
+    checkpoint/               # 训练产生的完整 checkpoint（full_step_xxx.pt）
+    log/                      # 以时间戳命名的 map.log / agents.jsonl 回放日志
+    config/                   # 训练时自动保存的 merge 后配置快照
 protolife/
-  env.py                    # 网格环境与规则实现
-  encoding.py               # 地图压缩编码
-  agents.py                 # 个体状态结构与批量管理
-  policy.py                 # 策略与价值网络
-  rewards.py                # 行为奖励配置
-  genetics.py               # 繁衍与变异逻辑
-  communication.py          # 消息接口
-  logger.py                 # 实验记录
-  replay.py                 # 回放工具
-  config_loader.py          # YAML 配置管理
+  env.py                      # 网格环境与规则实现
+  encoding.py                 # 地图压缩编码
+  agents.py                   # 个体状态结构与批量管理
+  policy.py                   # 策略与价值网络
+  rewards.py                  # 行为奖励配置
+  genetics.py                 # 繁衍与变异逻辑
+  communication.py            # 消息接口
+  logger.py                   # 实验记录
+  replay.py                   # 回放工具
+  config_loader.py            # YAML 配置管理
   utils/
     cuda_utils.py
     seed_utils.py
     schedulers.py
 scripts/
   train_phase0.py
-  map_editor.py              # 命令行地图编辑器
+  map_editor.py               # 命令行地图编辑器
 maps/
-  default_map.hex            # 简单示例地图（8×8 全空）
+  default_map.hex             # 简单示例地图（8×8 全空）
 ```
 
 ## 快速开始（可直接运行的最小 Demo）
@@ -50,7 +52,11 @@ maps/
 2. **运行基本 Demo**
    tip:请在项目根目录运行
    ```bash
-   python -m scripts.train_phase0 --config config/phase0_survival.yaml
+   # 将示例配置复制到自己的模型目录（只需一次）
+   mkdir -p model/demo && cp config/phase0_survival.yaml model/demo/demo.yaml
+
+   # 使用该目录进行训练/回放，所有日志与权重会放在 model/demo 下
+   python -m scripts.train_phase0 --config model/demo/demo.yaml --model-dir model/demo
    ```
    预期输出：
    - 打印观测张量的形状（map 与 agents）
@@ -98,24 +104,34 @@ maps/
      ```
 
 6. **模型与环境 checkpoint / 断点续推**
+   - 推荐每个模型/实验单独建目录：`model/<model_name>/`（如上文 Demo）。目录下需要有一份 `<model_name>.yaml` 作为训练/回放唯一入口。
    - 训练脚本新增参数：
      * `--save-interval`：每隔多少步保存模型与完整存档（默认读取配置中的 `training.save_interval`）。
-     * `--checkpoint-dir`：保存目录（默认 `training.checkpoint_dir`）。
+     * `--checkpoint-dir`：保存目录（默认指向 `model/<name>/checkpoint`）。
+     * `--model-dir` / `--model-name`：统一管理模型目录，便于续训或共享。
      * `--resume-from`：从完整 checkpoint 继续推演（恢复地图、agent 状态、优化器与步数）。
      * `--load-model`：仅加载模型权重，在新地图或新实验上测试。
    - 示例：
      ```bash
-     # 带定期保存
-     python -m scripts.train_phase0 --config config/phase0_survival.yaml --save-interval 50 --checkpoint-dir checkpoints/demo
+     # 带定期保存（日志与 checkpoint 全部写到 model/demo）
+     python -m scripts.train_phase0 --config model/demo/demo.yaml --model-dir model/demo --save-interval 50
 
-     # 从指定存档继续
-     python -m scripts.train_phase0 --config config/phase0_survival.yaml --resume-from checkpoints/demo/full_step_200.pt
+     # 从最新 checkpoint 直接续训（自动定位 model/demo/checkpoint 下最新 full_step_*.pt）
+     python -m scripts.train_phase0 --config model/demo/demo.yaml --model-dir model/demo
+
+     # 显式指定某个存档继续
+     python -m scripts.train_phase0 --config model/demo/demo.yaml --resume-from model/demo/checkpoint/full_step_200.pt
      ```
 
    - checkpoint 内容包括：当前地图、全部 agent 状态、策略网络参数、优化器参数与当前步数，可直接用于“继续推演”或模型回滚。
 
-7. **实时渲染与回放**
+7. **实时渲染、日志与回放**
    - `logging.realtime_render: true` 时，环境会用 matplotlib 绘制首个并行环境的地图与 agent 位置（参考 `map_editor` 的配色，需安装 matplotlib）。
     - `logging.save_dir` 与 `logging.snapshot_interval` 控制回放日志写入；运行结束后可用 `protolife.replay.playback(log_dir, height, width)` 或脚本 `python -m scripts.visualize_replay --log-dir <dir> --height <H> --width <W>` 在 Python 交互式环境中快速查看轨迹。
+    - 每次运行会按照时间戳生成 `<tag>_map.log` 与 `<tag>_agents.jsonl`（第一行包含元数据）：`map.log` 记录压缩地图快照，`agents.jsonl` 记录每个 step 的个体状态摘要。需要回放时可直接将 `--log-dir` 指向 `model/<name>/log`，脚本会自动匹配最新的成对日志。
+    - 续训或回放步骤：
+      1. 进入对应的模型目录（例如 `model/demo/`），确认 `<model_name>.yaml`、`checkpoint/`、`log/` 存在。
+      2. 续训：执行 `python -m scripts.train_phase0 --config model/demo/demo.yaml --model-dir model/demo`（自动使用最新 checkpoint）。
+      3. 回放：执行 `python -m scripts.visualize_replay --log-dir model/demo/log --height <H> --width <W>` 或在代码中调用 `protolife.replay.playback`。
 
 本 README 为概览，详细设计思路请参考源码中的中文注释，后续可在此基础上逐步补全能量代谢、战斗、通信等真实逻辑。
