@@ -113,6 +113,7 @@ maps/
      * `--model-dir` / `--model-name`：统一管理模型目录，便于续训或共享。
      * `--resume-from`：从完整 checkpoint 继续推演（恢复地图、agent 状态、优化器与步数）。
      * `--load-model`：仅加载模型权重，在新地图或新实验上测试。
+     * 启动时会打印模型目录、配置文件、checkpoint 目录以及检测到的 `full_step_*.pt` 完整路径，便于确认输入输出位置。
    - 示例：
      ```bash
      # 带定期保存（日志与 checkpoint 全部写到 model/demo）

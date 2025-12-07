@@ -137,6 +137,7 @@ def main() -> None:
     model_config_path.write_text(yaml.safe_dump(merged_config, allow_unicode=True), encoding="utf-8")
     print(f"模型目录: {model_dir.resolve()}")
     print(f"配置文件: {config_path.resolve()}")
+    print(f"Checkpoint 目录: {checkpoint_dir.resolve()}")
     set_seed(get_cfg(config, default_config, "world", "random_seed", 0))
 
     env = ProtoLifeEnv(config, default_config)
@@ -190,6 +191,7 @@ def main() -> None:
         checkpoint_path = latest_checkpoint
 
     if checkpoint_path:
+        print(f"使用的 checkpoint: {checkpoint_path.resolve()}")
         env_state, policy_state, optim_state, meta = load_checkpoint(checkpoint_path, map_location=env.device)
         env.load_state(env_state)
         policy.load_state_dict(policy_state)
@@ -199,6 +201,7 @@ def main() -> None:
         obs = env._build_observations()
         print(f"从 checkpoint 恢复，起始 step={start_step}，来源: {checkpoint_path}")
     else:
+        print("未找到现有 checkpoint，将从头开始训练。")
         obs = env.reset()
         if args.load_model:
             state = torch.load(args.load_model, map_location=env.device)
