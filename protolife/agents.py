@@ -39,7 +39,7 @@ class AgentBatch:
             "health": torch.zeros(shape, dtype=torch.float32, device=self.device),
             "age": torch.zeros(shape, dtype=torch.int64, device=self.device),
             "mood": torch.zeros(shape + (2,), dtype=torch.float32, device=self.device),
-            "comm": torch.zeros(shape + (2,), dtype=torch.int64, device=self.device),
+            "comm": torch.zeros(shape + (2,), dtype=torch.float32, device=self.device),
             "genome_id": torch.zeros(shape, dtype=torch.int64, device=self.device),
             "generation": torch.zeros(shape, dtype=torch.int64, device=self.device),
         }

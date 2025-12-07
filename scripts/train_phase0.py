@@ -36,6 +36,29 @@ TRAIN_DEFAULTS = {
 }
 
 
+def _load_state_dict_lenient(model: torch.nn.Module, state_dict: dict) -> bool:
+    """加载 state_dict，自动跳过尺寸不匹配的权重并返回是否有跳过。"""
+
+    current = model.state_dict()
+    compatible: dict[str, torch.Tensor] = {}
+    dropped_keys = []
+    for key, tensor in state_dict.items():
+        if key not in current:
+            continue
+        if tensor.shape != current[key].shape:
+            dropped_keys.append(key)
+            continue
+        compatible[key] = tensor
+
+    model.load_state_dict(compatible, strict=False)
+    if dropped_keys:
+        print(
+            "[警告] 以下权重尺寸不匹配，已跳过加载（可能是 observation_radius 调整导致）：",
+            dropped_keys,
+        )
+    return bool(dropped_keys)
+
+
 def get_cfg(config: dict, default_config: dict, section: str, key: str, fallback):
     return config.get(section, {}).get(
         key,
@@ -207,8 +230,8 @@ def main() -> None:
         print(f"使用的 checkpoint: {checkpoint_path.resolve()}")
         env_state, policy_state, optim_state, meta = load_checkpoint(checkpoint_path, map_location=env.device)
         env.load_state(env_state)
-        policy.load_state_dict(policy_state)
-        if optim_state:
+        skipped = _load_state_dict_lenient(policy, policy_state)
+        if optim_state and not skipped:
             optimizer.load_state_dict(optim_state)
         start_step = int(meta.get("step", 0))
         obs = env._build_observations()
@@ -218,7 +241,7 @@ def main() -> None:
         obs = env.reset()
         if args.load_model:
             state = torch.load(args.load_model, map_location=env.device)
-            policy.load_state_dict(state)
+            _load_state_dict_lenient(policy, state)
             print(f"仅加载模型参数：{args.load_model}")
 
     total_steps = start_step
