@@ -131,6 +131,8 @@ class ProtoLifeEnv:
         else:
             self.map_state = self._generate_random_map().to(self.device)
         self.toxin_age.zero_()
+        self._scatter_resources(respawn=False)
+        self._reset_toxin_age_for_existing_toxins()
         self.step_count = 0
         self.agent_batch.reset(
             self.height,
@@ -371,6 +373,13 @@ class ProtoLifeEnv:
         if self.toxin_lifetime:
             new_toxin_cells = toxin_mask & (~existing_toxin)
             self.toxin_age = torch.where(new_toxin_cells, torch.zeros_like(self.toxin_age), self.toxin_age)
+
+    def _reset_toxin_age_for_existing_toxins(self) -> None:
+        """确保当前地图上的毒素年龄归零，用于重置或从地图加载。"""
+
+        toxin_mask = (self.map_state & BIT_TOXIN).bool()
+        if toxin_mask.any():
+            self.toxin_age = torch.where(toxin_mask, torch.zeros_like(self.toxin_age), self.toxin_age)
 
     def _maybe_respawn_resources(self) -> None:
         """根据配置周期性刷新食物/毒素。"""
