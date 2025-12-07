@@ -47,23 +47,27 @@ maps/
 1. **准备 Python 环境**
    - 建议 Python 3.9+，可用 `python -m venv .venv && source .venv/bin/activate` 创建虚拟环境。
    - 安装依赖（CPU 版本示例）：`pip install torch pyyaml`。
-   - 若需要 GPU/CUDA，请根据显卡与 CUDA 版本替换为官方给出的 `pip install torch==<ver>+cu118 -f https://download.pytorch.org/whl/torch_stable.html`。
+   - 若需要 GPU/CUDA，请根据显卡与 CUDA 版本替换为官方给出的 `pip install torch==<ver>+cu118 -f https://download.pytorch.org/whl/torch_stable.html` 或直接使用给出的 `pip_CUDA121.bat` ，这是绝大部分搭载较新的NVIDIA GPU都能使用的一键安装脚本。
+   - 中国朋友请记得先切换pip清华源，方法自行搜索。
 
 2. **运行基本 Demo**
    tip:请在项目根目录运行
    ```bash
-   # 将示例配置复制到自己的模型目录（只需一次）
-   mkdir -p model/demo && cp config/phase0_survival.yaml model/demo/demo.yaml
-
-   # 使用该目录进行训练/回放，所有日志与权重会放在 model/demo 下
-   python -m scripts.train_phase0 --config model/demo/demo.yaml --model-dir model/demo
+   # 初次使用
+   python -m scripts.train_phase0 --config .\config\default.yaml
+   ```
+   按照指引对模型命名后，训练就开始了。如果需要修改参数，请先Ctrl+C停止代码运行，然后到 `model/<model_name>/<model_name>.yaml` 中更改。相关参数的注释在config/default.yaml
+   ```bash
+   # 再次训练
+   python -m scripts.train_phase0 --model-dir model/<model_name>
    ```
    预期输出：
-   - 打印观测张量的形状（map 与 agents）
-   - 打印策略网络的 logits 形状
+   - 打印训练进度和速率
+   - 显示模型实时画面(如果开启了"实时渲染"的话)
    - 打印一次环境步进后的平均奖励
-
-   如果不提供 `--config`，脚本会默认尝试加载 `model/<name>/<name>.yaml`，并在每次训练开始时打印所使用的模型目录与配置文件的完整路径，便于确认当前实验的来源与产出位置。
+   
+   仅提供 `--model-dir` 时，脚本会，默认从中加载所有模型，如果提供 `--config` 则会使用传入参数覆盖 `model/<model_name>` 
+   如果不提供 `--config`，脚本会默认尝试加载 `model/<model_name>/<model_name>.yaml`，并在每次训练开始时打印所使用的模型目录与配置文件的完整路径，便于确认当前实验的来源与产出位置。
 
 3. **配置文件讲解与自定义**
    所有 YAML 位于 `config/`，推荐以 `config/default.yaml` 为基础：
@@ -116,14 +120,16 @@ maps/
      * 启动时会打印模型目录、配置文件、checkpoint 目录以及检测到的 `full_step_*.pt` 完整路径，便于确认输入输出位置。
    - 示例：
      ```bash
-     # 带定期保存（日志与 checkpoint 全部写到 model/demo）
-     python -m scripts.train_phase0 --config model/demo/demo.yaml --model-dir model/demo --save-interval 50
-
-     # 从最新 checkpoint 直接续训（自动定位 model/demo/checkpoint 下最新 full_step_*.pt）
-     python -m scripts.train_phase0 --config model/demo/demo.yaml --model-dir model/demo
+     # 从最新 checkpoint 直接续训（自动定位 model/<model_name>/checkpoint 下最新 full_step_*.pt）
+     python -m scripts.train_phase0 --model-dir model/<model_name>
 
      # 显式指定某个存档继续
-     python -m scripts.train_phase0 --config model/demo/demo.yaml --resume-from model/demo/checkpoint/full_step_200.pt
+     python -m scripts.train_phase0 --resume-from model/<model_name>/checkpoint/full_step_200.pt
+
+     # 从其他模型加载
+     python -m scripts.train_phase0 --resume-from /<model_name>/checkpoint/full_step_200.pt
+     
+     # 加载他人分享的模型只需要把模型文件夹复制到自己的model/下就可以使用--model-dir调用了
      ```
 
    - checkpoint 内容包括：当前地图、全部 agent 状态、策略网络参数、优化器参数与当前步数，可直接用于“继续推演”或模型回滚。
@@ -136,7 +142,7 @@ maps/
       1. 进入对应的模型目录（例如 `model/demo/`），确认 `<model_name>.yaml`、`checkpoint/`、`log/` 存在。
       2. 回放：在'项目根目录'执行
          ```bash
-         python -m scripts.visualize_replay --log-target model/test 
+         python -m scripts.visualize_replay --log-target model/<model_name> 
          ```
 
          或在代码中调用 `protolife.replay.playback`。
