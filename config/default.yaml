@@ -3,21 +3,21 @@ world:
   height: 64  # 地图高度
   width: 64   # 地图宽度
   map_file: "maps/t_64.hex"  # 自定义地图文件路径，null 表示随机生成
-  food_density: 0.05  # 初始食物密度
-  toxin_density: 0.1  # 初始毒素密度
-  food_respawn_interval: 64  # 每隔多少步重新撒一次食物，0 表示关闭
+  food_density: 0.08  # 初始食物密度
+  toxin_density: 0.05  # 初始毒素密度
+  food_respawn_interval: 256  # 每隔多少步重新撒一次食物，0 表示关闭
   toxin_respawn_interval: 256  # 每隔多少步重新撒一次毒素，0 表示关闭
   toxin_lifetime: 257   # 毒素存续步数，超过后自动衰减
   random_seed: 42  # 随机种子，方便复现
   resource_noise:  # 使用 Perlin Noise 生成更平滑的资源分布，可关闭回退到均匀随机
     enabled: true
-    scale: 16.0       # 控制噪声纹理尺寸，值越大区域越大
+    scale: 8.0       # 控制噪声纹理尺寸，值越大区域越大
     octaves: 2        # 叠加的噪声层数，提升复杂度
     persistence: 0.5  # 每层振幅衰减系数
     lacunarity: 2.0   # 频率倍增系数
-    seed: 1234        # 噪声随机种子，null 表示使用 random_seed 或随机生成
-    food_bias: 0.05   # 对食物分布的额外偏移，可正可负
-    toxin_bias: -0.05 # 对毒物分布的额外偏移，可正可负
+    seed: null        # 噪声随机种子，null 表示使用 random_seed 或随机生成
+    food_bias: 0.1   # 对食物分布的额外偏移，可正可负
+    toxin_bias: -0.1 # 对毒物分布的额外偏移，可正可负
 
 # 模型结构参数
 model:
@@ -67,8 +67,8 @@ logging:
 
 # 动作基础奖励表
 action_rewards:
-  STAY: -0.01
-  MOVE: 0.01
+  STAY: -0.02
+  MOVE: 0.02
   EAT: 0.01
   ATTACK: 0.02
   COMMUNICATE: 0.03
@@ -87,6 +87,6 @@ rewards:
   toxin_eat_penalty: -0.4    # 在毒物格执行 EAT 额外惩罚
   enable_proximity_reward: true  # 是否启用视野内食物距离奖励
   see_food_reward: 0.001          # 视野中发现食物的基础奖励（距离衰减前）
-  stand_on_food_reward: 0.02      # 踩在食物格上的基础奖励
+  stand_on_food_reward: 0.03      # 踩在食物格上的基础奖励
   vision_decay_mode: log       # 距离衰减模式：linear 或 log
   vision_decay_coefficient: 1.0   # 距离衰减系数（随距离增大奖励降低）
