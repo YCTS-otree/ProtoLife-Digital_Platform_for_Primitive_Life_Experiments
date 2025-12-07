@@ -129,9 +129,13 @@ maps/
    - `logging.realtime_render: true` 时，环境会用 matplotlib 绘制首个并行环境的地图与 agent 位置（参考 `map_editor` 的配色，需安装 matplotlib）。
     - `logging.save_dir` 与 `logging.snapshot_interval` 控制回放日志写入；运行结束后可用 `protolife.replay.playback(log_dir, height, width)` 或脚本 `python -m scripts.visualize_replay --log-dir <dir> --height <H> --width <W>` 在 Python 交互式环境中快速查看轨迹。
     - 每次运行会按照时间戳生成 `<tag>_map.log` 与 `<tag>_agents.jsonl`（第一行包含元数据）：`map.log` 记录压缩地图快照，`agents.jsonl` 记录每个 step 的个体状态摘要。需要回放时可直接将 `--log-dir` 指向 `model/<name>/log`，脚本会自动匹配最新的成对日志。
-    - 续训或回放步骤：
+    - 回放：
       1. 进入对应的模型目录（例如 `model/demo/`），确认 `<model_name>.yaml`、`checkpoint/`、`log/` 存在。
-      2. 续训：执行 `python -m scripts.train_phase0 --config model/demo/demo.yaml --model-dir model/demo`（自动使用最新 checkpoint）。
-      3. 回放：执行 `python -m scripts.visualize_replay --log-dir model/demo/log --height <H> --width <W>` 或在代码中调用 `protolife.replay.playback`。
+      2. 回放：在'项目根目录'执行
+         ```bash
+         python -m scripts.visualize_replay --log-dir model/demo/log --height <H> --width <W>
+         ```
+
+         或在代码中调用 `protolife.replay.playback`。
 
 本 README 为概览，详细设计思路请参考源码中的中文注释，后续可在此基础上逐步补全能量代谢、战斗、通信等真实逻辑。
