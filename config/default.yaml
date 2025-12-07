@@ -3,10 +3,10 @@ world:
   height: 64  # 地图高度
   width: 64   # 地图宽度
   map_file: "maps/t_64.hex"  # 自定义地图文件路径，null 表示随机生成
-  food_density: 0.03  # 初始食物密度
+  food_density: 0.05  # 初始食物密度
   toxin_density: 0.01  # 初始毒素密度
-  food_respawn_interval: 0  # 每隔多少步重新撒一次食物，0 表示关闭
-  toxin_respawn_interval: 0  # 每隔多少步重新撒一次毒素，0 表示关闭
+  food_respawn_interval: 32  # 每隔多少步重新撒一次食物，0 表示关闭
+  toxin_respawn_interval: 512  # 每隔多少步重新撒一次毒素，0 表示关闭
   food_respawn_steps: 50  # 食物补给的步间隔（预留，当前未使用）
   toxin_decay_steps: 80   # 毒素衰减步数（预留，当前未使用）
   random_seed: 42  # 随机种子，方便复现
@@ -30,7 +30,7 @@ agents:
 # 训练超参与调试开关
 training:
   num_envs: 1  # 并行环境数量
-  rollout_steps: 32768  # 单次收集的步数
+  rollout_steps: 65536  # 单次收集的步数
   gamma: 0.99  # 折扣因子
   gae_lambda: 0.95  # GAE 参数
   ppo_clip: 0.2  # PPO clip 系数（预留）
@@ -38,10 +38,10 @@ training:
   action_noise:  # 行动时额外注入的噪声配置
     gaussian_std: 0.001  # 对 logits 添加的高斯噪声标准差
     epsilon: 0.001  # 以 epsilon 概率使用均匀随机动作（epsilon-greedy）
-  save_interval: 2048  # 模型/存档保存间隔
-  checkpoint_dir: checkpoints  # checkpoint 输出目录
+  save_interval: 4096  # 模型/存档保存间隔
+  checkpoint_dir: K:/Proto_Digital_Life/checkpoints  # checkpoint 输出目录
   print_actions: false  # 是否打印每步动作，便于调试
-  print_interval: 128  # 进度打印间隔（步数）
+  print_interval: 64  # 进度打印间隔（步数）
 
 # 功能开关
 features:
@@ -59,14 +59,14 @@ logging:
 
 # 动作基础奖励表
 action_rewards:
-  STAY: -0.05
+  STAY: -0.01
   MOVE: 0.01
   EAT: 0.01
-  ATTACK: -0.05
-  COMMUNICATE: -0.05
-  BUILD: -0.05
-  REMOVE: -0.05
-  REPRODUCE: -0.05
+  ATTACK: 0.02
+  COMMUNICATE: 0.03
+  BUILD: 0.02
+  REMOVE: 0.02
+  REPRODUCE: 0.05
 
 # 额外奖励/惩罚系数
 rewards:
@@ -78,7 +78,7 @@ rewards:
   failed_eat_penalty: -0.005  # 使用 EAT 但当前格没有食物的惩罚
   toxin_eat_penalty: -0.4    # 在毒物格执行 EAT 额外惩罚
   enable_proximity_reward: true  # 是否启用视野内食物距离奖励
-  see_food_reward: 0.005          # 视野中发现食物的基础奖励（距离衰减前）
+  see_food_reward: 0.001          # 视野中发现食物的基础奖励（距离衰减前）
   stand_on_food_reward: 0.02      # 踩在食物格上的基础奖励
-  vision_decay_mode: linear       # 距离衰减模式：linear 或 log
+  vision_decay_mode: log       # 距离衰减模式：linear 或 log
   vision_decay_coefficient: 1.0   # 距离衰减系数（随距离增大奖励降低）
