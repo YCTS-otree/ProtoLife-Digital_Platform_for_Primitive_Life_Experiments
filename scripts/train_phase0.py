@@ -72,12 +72,15 @@ def _merge_dict(default: dict, override: dict) -> dict:
     return result
 
 
-def _prepare_model_dir(args: argparse.Namespace, fallback_tag: str) -> Path:
+def _prepare_model_dir(args: argparse.Namespace, fallback_tag: str) -> tuple[Path, str]:
     root = Path("model")
     root.mkdir(exist_ok=True)
 
+    explicit_name = _sanitize_name(args.model_name) if args.model_name else ""
+
     if args.model_dir:
         candidate = Path(str(args.model_dir).replace(" ", "_"))
+        model_name = explicit_name or _sanitize_name(candidate.name) or fallback_tag
     else:
         raw_name = args.model_name or ""
         if not raw_name:
@@ -86,15 +89,17 @@ def _prepare_model_dir(args: argparse.Namespace, fallback_tag: str) -> Path:
             except EOFError:
                 raw_name = ""
         sanitized = _sanitize_name(raw_name) if raw_name else ""
-        candidate = root / (sanitized or fallback_tag)
+        model_name = sanitized or fallback_tag
+        candidate = root / model_name
 
     try:
         candidate.mkdir(parents=True, exist_ok=True)
-        return candidate
     except OSError:
-        fallback = root / fallback_tag
-        fallback.mkdir(parents=True, exist_ok=True)
-        return fallback
+        candidate = root / fallback_tag
+        candidate.mkdir(parents=True, exist_ok=True)
+        model_name = _sanitize_name(candidate.name) or fallback_tag
+
+    return candidate, model_name
 
 
 def _find_latest_full_checkpoint(checkpoint_dir: Path) -> Path | None:
@@ -108,18 +113,18 @@ def main() -> None:
     args = parse_args()
     config, default_config = load_config(args.config)
     run_tag = time.strftime("%Y%m%d_%H%M%S")
-    model_dir = _prepare_model_dir(args, run_tag)
+    model_dir, model_name = _prepare_model_dir(args, run_tag)
     log_dir = model_dir / "log"
-    checkpoint_dir = (
-        Path(args.checkpoint_dir)
-        if args.checkpoint_dir
-        else model_dir / "checkpoint"
-    )
-    config_dir = model_dir / "config"
-    config_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = model_dir / (args.checkpoint_dir or "checkpoint")
+
+    model_config_path = model_dir / f"{model_name}.yaml"
+    existing_model_config = {}
+    if model_config_path.exists():
+        existing_model_config = yaml.safe_load(model_config_path.read_text(encoding="utf-8")) or {}
+
+    config = _merge_dict(existing_model_config, config)
     merged_config = _merge_dict(default_config, config)
-    merged_config_path = config_dir / f"{run_tag}_merged.yaml"
-    merged_config_path.write_text(yaml.safe_dump(merged_config, allow_unicode=True), encoding="utf-8")
+    model_config_path.write_text(yaml.safe_dump(merged_config, allow_unicode=True), encoding="utf-8")
     set_seed(get_cfg(config, default_config, "world", "random_seed", 0))
 
     env = ProtoLifeEnv(config, default_config)
