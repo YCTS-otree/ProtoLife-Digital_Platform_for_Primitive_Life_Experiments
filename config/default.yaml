@@ -5,10 +5,10 @@ world:
   map_file: "maps/t_64.hex"  # 自定义地图文件路径，null 表示随机生成
   food_density: 0.05  # 初始食物密度
   toxin_density: 0.01  # 初始毒素密度
-  food_respawn_interval: 32  # 每隔多少步重新撒一次食物，0 表示关闭
-  toxin_respawn_interval: 512  # 每隔多少步重新撒一次毒素，0 表示关闭
+  food_respawn_interval: 0  # 每隔多少步重新撒一次食物，0 表示关闭
+  toxin_respawn_interval: 2  # 每隔多少步重新撒一次毒素，0 表示关闭
   food_respawn_steps: 50  # 食物补给的步间隔（预留，当前未使用）
-  toxin_decay_steps: 80   # 毒素衰减步数（预留，当前未使用）
+  toxin_decay_steps: 2   # 毒素衰减步数
   random_seed: 42  # 随机种子，方便复现
 
 # 模型结构参数
@@ -53,7 +53,7 @@ features:
 # 日志与可视化设置
 logging:
   snapshot_interval: 16  # 记录快照的步间隔
-  realtime_render: false  # 是否开启实时渲染
+  realtime_render: true  # 是否开启实时渲染
   save_dir: runs/default  # 日志目录
   env_index: 0  # 多环境时选择写入第几个环境的快照
 
