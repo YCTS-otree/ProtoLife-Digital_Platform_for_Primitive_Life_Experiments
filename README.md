@@ -63,6 +63,8 @@ maps/
    - 打印策略网络的 logits 形状
    - 打印一次环境步进后的平均奖励
 
+   如果不提供 `--config`，脚本会默认尝试加载 `model/<name>/<name>.yaml`，并在每次训练开始时打印所使用的模型目录与配置文件的完整路径，便于确认当前实验的来源与产出位置。
+
 3. **配置文件讲解与自定义**
    所有 YAML 位于 `config/`，推荐以 `config/default.yaml` 为基础：
    - `world`：地图尺寸、随机地图中食物/毒素密度、随机种子、外部地图文件（示例：`height: 64`, `width: 64`, `map_file: maps/default_map.hex`）。如果提供了 `map_file` 且文件存在，会优先加载该地图，否则回退到随机/空白地图并按 `food_density`/`toxin_density` 撒点资源。
