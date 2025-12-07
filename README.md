@@ -133,7 +133,7 @@ maps/
       1. 进入对应的模型目录（例如 `model/demo/`），确认 `<model_name>.yaml`、`checkpoint/`、`log/` 存在。
       2. 回放：在'项目根目录'执行
          ```bash
-         python -m scripts.visualize_replay --log-dir model/demo/log --height <H> --width <W>
+         python -m scripts.visualize_replay --log-target model/test 
          ```
 
          或在代码中调用 `protolife.replay.playback`。
