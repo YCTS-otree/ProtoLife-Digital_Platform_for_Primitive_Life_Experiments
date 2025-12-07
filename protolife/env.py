@@ -35,6 +35,7 @@ ENV_DEFAULTS = {
         "toxin_density": 0.01,
         "food_respawn_interval": 0,
         "toxin_respawn_interval": 0,
+        "toxin_lifetime": 0,
     },
     "model": {"observation_radius": 2},
     "agents": {
@@ -96,6 +97,7 @@ class ProtoLifeEnv:
         self.toxin_respawn_interval = self._get(
             "world", "toxin_respawn_interval", ENV_DEFAULTS["world"]["toxin_respawn_interval"]
         )
+        self.toxin_lifetime = self._get("world", "toxin_lifetime", 0)
         action_reward_cfg = config.get("action_rewards", self.default_config.get("action_rewards", {}))
         self.action_rewards = build_action_reward_table(action_reward_cfg).to(self.device)
         self.agent_batch = AgentBatch(
@@ -105,6 +107,9 @@ class ProtoLifeEnv:
         )
         self._map_template = self._load_map_template().to(self.device)
         self.map_state = torch.zeros(
+            (self.agent_batch.num_envs, self.height, self.width), dtype=torch.int64, device=self.device
+        )
+        self.toxin_age = torch.zeros(
             (self.agent_batch.num_envs, self.height, self.width), dtype=torch.int64, device=self.device
         )
         self.renderer = None
@@ -125,6 +130,7 @@ class ProtoLifeEnv:
             self.map_state = self._map_template.clone().expand(self.agent_batch.num_envs, -1, -1).contiguous()
         else:
             self.map_state = self._generate_random_map().to(self.device)
+        self.toxin_age.zero_()
         self.step_count = 0
         self.agent_batch.reset(
             self.height,
@@ -258,6 +264,9 @@ class ProtoLifeEnv:
         # 周期性刷新资源/毒素
         self._maybe_respawn_resources()
 
+        # 毒素衰减
+        self._decay_toxins()
+
         dones = (energy <= 0) | (health <= 0)
         infos: List[Dict] = [
             {"message": "存活状态" if not dones.view(-1)[i] else "能量或健康耗尽"}
@@ -300,6 +309,7 @@ class ProtoLifeEnv:
         return {
             "map_state": self.map_state.detach().cpu(),
             "agent_state": self.agent_batch.state_dict(),
+            "toxin_age": self.toxin_age.detach().cpu(),
         }
 
     def load_state(self, state: Dict[str, torch.Tensor]) -> None:
@@ -308,6 +318,7 @@ class ProtoLifeEnv:
         self.map_state = state["map_state"].to(self.device)
         self._map_template = self.map_state[:1].clone()
         self.agent_batch.load_state_dict(state["agent_state"], self.height, self.width)
+        self.toxin_age = state.get("toxin_age", torch.zeros_like(self.map_state)).to(self.device)
 
     def _load_map_template(self) -> torch.Tensor:
         """加载单张地图模板，若未指定则返回全零地图。"""
@@ -354,8 +365,12 @@ class ProtoLifeEnv:
             wall_mask = (self.map_state & BIT_TERRAIN_0).bool()
             food_mask = food_mask & (~wall_mask)
             toxin_mask = toxin_mask & (~wall_mask)
+        existing_toxin = (self.map_state & BIT_TOXIN).bool()
         self.map_state = torch.where(food_mask, self.map_state | BIT_FOOD, self.map_state)
         self.map_state = torch.where(toxin_mask, self.map_state | BIT_TOXIN, self.map_state)
+        if self.toxin_lifetime:
+            new_toxin_cells = toxin_mask & (~existing_toxin)
+            self.toxin_age = torch.where(new_toxin_cells, torch.zeros_like(self.toxin_age), self.toxin_age)
 
     def _maybe_respawn_resources(self) -> None:
         """根据配置周期性刷新食物/毒素。"""
@@ -366,6 +381,19 @@ class ProtoLifeEnv:
         if self.toxin_respawn_interval and self.toxin_respawn_interval > 0:
             if self.step_count % self.toxin_respawn_interval == 0:
                 self._scatter_resources(respawn=True)
+
+    def _decay_toxins(self) -> None:
+        """当毒素存续超过寿命时将其从地图上移除。"""
+
+        if not self.toxin_lifetime or self.toxin_lifetime <= 0:
+            return
+
+        toxin_mask = (self.map_state & BIT_TOXIN).bool()
+        self.toxin_age = torch.where(toxin_mask, self.toxin_age + 1, torch.zeros_like(self.toxin_age))
+        expired = toxin_mask & (self.toxin_age >= self.toxin_lifetime)
+        if expired.any():
+            self.map_state = torch.where(expired, self.map_state & (~BIT_TOXIN), self.map_state)
+            self.toxin_age = torch.where(expired, torch.zeros_like(self.toxin_age), self.toxin_age)
 
     def _extract_local_observation(self) -> torch.Tensor:
         """裁剪每个体周围 r 范围内的网格并转为 multi-hot 通道。"""

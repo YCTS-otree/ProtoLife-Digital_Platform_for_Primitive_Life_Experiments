@@ -6,10 +6,13 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import re
 import time
 from pathlib import Path
 
 import torch
+import yaml
 
 from protolife.config_loader import load_config
 from protolife.checkpoint import load_checkpoint, save_checkpoint
@@ -45,15 +48,78 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=str, default="config/phase0_survival.yaml", help="配置文件路径")
     parser.add_argument("--save-interval", type=int, default=None, help="多少步保存一次模型/存档")
     parser.add_argument("--checkpoint-dir", type=str, default=None, help="checkpoint 输出目录")
+    parser.add_argument("--model-dir", type=str, default=None, help="模型目录，支持指向已有模型继续训练")
+    parser.add_argument("--model-name", type=str, default=None, help="模型名称，若缺省则交互式输入")
     parser.add_argument("--resume-from", type=str, default=None, help="从完整 checkpoint 继续推演")
     parser.add_argument("--load-model", type=str, default=None, help="仅加载模型权重")
     parser.add_argument("--print-interval", type=int, default=None, help="训练日志打印间隔")
     return parser.parse_args()
 
 
+def _sanitize_name(name: str) -> str:
+    name = re.sub(r"\s+", "_", name.strip())
+    name = re.sub(r"[^\w.-]", "_", name)
+    return name
+
+
+def _merge_dict(default: dict, override: dict) -> dict:
+    result = copy.deepcopy(default)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _merge_dict(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def _prepare_model_dir(args: argparse.Namespace, fallback_tag: str) -> Path:
+    root = Path("model")
+    root.mkdir(exist_ok=True)
+
+    if args.model_dir:
+        candidate = Path(str(args.model_dir).replace(" ", "_"))
+    else:
+        raw_name = args.model_name or ""
+        if not raw_name:
+            try:
+                raw_name = input("请输入本次训练的模型名称(留空则使用时间戳): ")
+            except EOFError:
+                raw_name = ""
+        sanitized = _sanitize_name(raw_name) if raw_name else ""
+        candidate = root / (sanitized or fallback_tag)
+
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+        return candidate
+    except OSError:
+        fallback = root / fallback_tag
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+
+def _find_latest_full_checkpoint(checkpoint_dir: Path) -> Path | None:
+    if not checkpoint_dir.exists():
+        return None
+    candidates = sorted(checkpoint_dir.glob("full_step_*.pt"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0] if candidates else None
+
+
 def main() -> None:
     args = parse_args()
     config, default_config = load_config(args.config)
+    run_tag = time.strftime("%Y%m%d_%H%M%S")
+    model_dir = _prepare_model_dir(args, run_tag)
+    log_dir = model_dir / "log"
+    checkpoint_dir = (
+        Path(args.checkpoint_dir)
+        if args.checkpoint_dir
+        else model_dir / "checkpoint"
+    )
+    config_dir = model_dir / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    merged_config = _merge_dict(default_config, config)
+    merged_config_path = config_dir / f"{run_tag}_merged.yaml"
+    merged_config_path.write_text(yaml.safe_dump(merged_config, allow_unicode=True), encoding="utf-8")
     set_seed(get_cfg(config, default_config, "world", "random_seed", 0))
 
     env = ProtoLifeEnv(config, default_config)
@@ -61,19 +127,28 @@ def main() -> None:
     optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
 
     logger = None
-    if get_cfg(config, default_config, "logging", "save_dir", None):
+    if get_cfg(config, default_config, "logging", "save_dir", True):
         from protolife.logger import ExperimentLogger
 
+        log_dir.mkdir(parents=True, exist_ok=True)
         logger = ExperimentLogger(
-            save_dir=get_cfg(config, default_config, "logging", "save_dir", "runs/default"),
+            save_dir=log_dir,
             snapshot_interval=get_cfg(config, default_config, "logging", "snapshot_interval", 50),
             env_index=get_cfg(config, default_config, "logging", "env_index", 0),
+            run_tag=run_tag,
+            metadata={
+                "height": env.height,
+                "width": env.width,
+                "num_envs": env.agent_batch.num_envs,
+                "agents_per_env": env.agent_batch.agents_per_env,
+                "run_name": model_dir.name,
+                "run_tag": run_tag,
+                "map_file": env.map_file,
+                "toxin_lifetime": getattr(env, "toxin_lifetime", None),
+            },
         )
 
-    checkpoint_dir = Path(
-        args.checkpoint_dir
-        or get_cfg(config, default_config, "training", "checkpoint_dir", "checkpoints")
-    )
+    checkpoint_dir = Path(checkpoint_dir)
     save_interval = args.save_interval or get_cfg(config, default_config, "training", "save_interval", 100)
     print_actions = get_cfg(config, default_config, "training", "print_actions", False)
     entropy_coef = get_cfg(config, default_config, "training", "entropy_coef", 0.01)
@@ -91,15 +166,21 @@ def main() -> None:
     epsilon_greedy = float(action_noise_cfg.get("epsilon", 0.0) or 0.0)
 
     start_step = 0
+    latest_checkpoint = _find_latest_full_checkpoint(checkpoint_dir)
     if args.resume_from:
-        env_state, policy_state, optim_state, meta = load_checkpoint(Path(args.resume_from), map_location=env.device)
+        checkpoint_path = Path(args.resume_from)
+    else:
+        checkpoint_path = latest_checkpoint
+
+    if checkpoint_path:
+        env_state, policy_state, optim_state, meta = load_checkpoint(checkpoint_path, map_location=env.device)
         env.load_state(env_state)
         policy.load_state_dict(policy_state)
         if optim_state:
             optimizer.load_state_dict(optim_state)
         start_step = int(meta.get("step", 0))
         obs = env._build_observations()
-        print(f"从 checkpoint 恢复，起始 step={start_step}")
+        print(f"从 checkpoint 恢复，起始 step={start_step}，来源: {checkpoint_path}")
     else:
         obs = env.reset()
         if args.load_model:
