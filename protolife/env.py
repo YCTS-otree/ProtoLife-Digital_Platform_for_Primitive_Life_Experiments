@@ -36,6 +36,16 @@ ENV_DEFAULTS = {
         "food_respawn_interval": 0,
         "toxin_respawn_interval": 0,
         "toxin_lifetime": 0,
+        "resource_noise": {
+            "enabled": False,
+            "scale": 12.0,
+            "octaves": 1,
+            "persistence": 0.5,
+            "lacunarity": 2.0,
+            "seed": None,
+            "food_bias": 0.0,
+            "toxin_bias": 0.0,
+        },
     },
     "model": {"observation_radius": 2},
     "agents": {
@@ -87,12 +97,17 @@ class ProtoLifeEnv:
         self.config = config
         self.default_config = default_config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.base_seed = self._get("world", "random_seed", None)
+        self.random_generator = torch.Generator(device=self.device)
+        if self.base_seed is not None:
+            self.random_generator.manual_seed(int(self.base_seed))
         self.height = self._get("world", "height", ENV_DEFAULTS["world"]["height"])
         self.width = self._get("world", "width", ENV_DEFAULTS["world"]["width"])
         self.map_file = self._get("world", "map_file", ENV_DEFAULTS["world"].get("map_file"))
         self.observation_radius = self._get("model", "observation_radius", ENV_DEFAULTS["model"]["observation_radius"])
         self.food_density = self._get("world", "food_density", ENV_DEFAULTS["world"]["food_density"])
         self.toxin_density = self._get("world", "toxin_density", ENV_DEFAULTS["world"]["toxin_density"])
+        self.resource_noise_cfg = self._get("world", "resource_noise", ENV_DEFAULTS["world"]["resource_noise"])
         self.food_respawn_interval = self._get(
             "world", "food_respawn_interval", ENV_DEFAULTS["world"]["food_respawn_interval"]
         )
@@ -358,6 +373,140 @@ class ProtoLifeEnv:
         grid[:, :, -1] |= BIT_TERRAIN_0
         return grid
 
+    def _perlin_noise(
+        self,
+        height: int,
+        width: int,
+        scale: float,
+        octaves: int,
+        persistence: float,
+        lacunarity: float,
+        seed: int,
+    ) -> torch.Tensor:
+        """生成指定大小的 Perlin Noise，返回值范围约在 [0, 1]。"""
+
+        def fade(t: torch.Tensor) -> torch.Tensor:
+            return 6 * t**5 - 15 * t**4 + 10 * t**3
+
+        noise = torch.zeros((height, width), device=self.device)
+        max_amplitude = 0.0
+        amplitude = 1.0
+        frequency = 1.0
+        generator = torch.Generator(device=self.device)
+        generator.manual_seed(int(seed))
+
+        xs = torch.arange(width, device=self.device).view(1, -1).expand(height, -1)
+        ys = torch.arange(height, device=self.device).view(-1, 1).expand(-1, width)
+
+        octave_count = max(int(octaves), 1)
+        for _ in range(octave_count):
+            effective_scale = max(scale, 1e-3) / max(frequency, 1e-3)
+            grid_w = int(torch.ceil(torch.tensor(width / effective_scale)).item()) + 2
+            grid_h = int(torch.ceil(torch.tensor(height / effective_scale)).item()) + 2
+            gradients = torch.randn((grid_h, grid_w, 2), device=self.device, generator=generator)
+            gradients = F.normalize(gradients, dim=-1)
+
+            nx = xs / effective_scale
+            ny = ys / effective_scale
+            x0 = torch.floor(nx).long()
+            y0 = torch.floor(ny).long()
+            x1 = x0 + 1
+            y1 = y0 + 1
+
+            dx = nx - x0
+            dy = ny - y0
+
+            g00 = gradients[y0, x0]
+            g10 = gradients[y0, x1]
+            g01 = gradients[y1, x0]
+            g11 = gradients[y1, x1]
+
+            dot00 = g00[..., 0] * dx + g00[..., 1] * dy
+            dot10 = g10[..., 0] * (dx - 1) + g10[..., 1] * dy
+            dot01 = g01[..., 0] * dx + g01[..., 1] * (dy - 1)
+            dot11 = g11[..., 0] * (dx - 1) + g11[..., 1] * (dy - 1)
+
+            u = fade(dx)
+            v = fade(dy)
+
+            nx0 = dot00 + u * (dot10 - dot00)
+            nx1 = dot01 + u * (dot11 - dot01)
+            value = nx0 + v * (nx1 - nx0)
+
+            noise += value * amplitude
+            max_amplitude += amplitude
+            amplitude *= persistence
+            frequency *= lacunarity
+
+        if max_amplitude > 0:
+            noise = noise / max_amplitude
+
+        noise_min, noise_max = noise.min(), noise.max()
+        if (noise_max - noise_min) > 1e-8:
+            noise = (noise - noise_min) / (noise_max - noise_min)
+        else:
+            noise = torch.zeros_like(noise)
+
+        return noise
+
+    def _noise_mask_for_density(
+        self,
+        density: float,
+        seed_offset: int,
+        bias: float,
+        wall_mask: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """使用 Perlin Noise 根据密度生成资源分布掩码。"""
+
+        if density <= 0:
+            return None
+
+        cfg = self.resource_noise_cfg or {}
+        base_seed = cfg.get("seed", self.base_seed)
+        scale = float(cfg.get("scale", 12.0))
+        octaves = int(cfg.get("octaves", 1))
+        persistence = float(cfg.get("persistence", 0.5))
+        lacunarity = float(cfg.get("lacunarity", 2.0))
+
+        masks = []
+        for env_idx in range(self.agent_batch.num_envs):
+            seed = base_seed if base_seed is not None else int(torch.seed())
+            seed = int(seed) + env_idx + seed_offset
+            noise = self._perlin_noise(
+                self.height,
+                self.width,
+                scale,
+                octaves,
+                persistence,
+                lacunarity,
+                seed,
+            )
+            if bias:
+                noise = torch.clamp(noise + bias, 0.0, 1.0)
+
+            available_mask = None
+            if wall_mask is not None:
+                available_mask = ~wall_mask[env_idx]
+
+            if available_mask is not None and available_mask.any():
+                valid_values = noise[available_mask]
+            else:
+                valid_values = noise.view(-1)
+
+            if valid_values.numel() == 0:
+                masks.append(torch.zeros_like(noise, dtype=torch.bool))
+                continue
+
+            threshold = torch.quantile(valid_values, max(0.0, 1 - density))
+            env_mask = noise >= threshold
+
+            if available_mask is not None:
+                env_mask = env_mask & available_mask
+
+            masks.append(env_mask)
+
+        return torch.stack(masks, dim=0) if masks else None
+
     def _scatter_resources(self, *, spawn_food: bool = True, spawn_toxin: bool = True, respawn: bool = False) -> None:
         """在地图上随机撒食物和毒素，便于快速获得奖励信号。"""
 
@@ -368,23 +517,43 @@ class ProtoLifeEnv:
         if respawn:
             wall_mask = (self.map_state & BIT_TERRAIN_0).bool()
 
+        use_noise = (self.resource_noise_cfg or {}).get("enabled", False)
+
         food_mask = None
         if spawn_food and self.food_density > 0:
-            food_mask = (
-                torch.rand((self.agent_batch.num_envs, self.height, self.width), device=self.device)
-                < self.food_density
-            )
-            if wall_mask is not None:
-                food_mask = food_mask & (~wall_mask)
+            if use_noise:
+                food_bias = float((self.resource_noise_cfg or {}).get("food_bias", 0.0))
+                food_mask = self._noise_mask_for_density(self.food_density, seed_offset=0, bias=food_bias, wall_mask=wall_mask)
+            else:
+                food_mask = (
+                    torch.rand(
+                        (self.agent_batch.num_envs, self.height, self.width),
+                        device=self.device,
+                        generator=self.random_generator,
+                    )
+                    < self.food_density
+                )
+                if wall_mask is not None:
+                    food_mask = food_mask & (~wall_mask)
 
         toxin_mask = None
         if spawn_toxin and self.toxin_density > 0:
-            toxin_mask = (
-                torch.rand((self.agent_batch.num_envs, self.height, self.width), device=self.device)
-                < self.toxin_density
-            )
-            if wall_mask is not None:
-                toxin_mask = toxin_mask & (~wall_mask)
+            if use_noise:
+                toxin_bias = float((self.resource_noise_cfg or {}).get("toxin_bias", 0.0))
+                toxin_mask = self._noise_mask_for_density(
+                    self.toxin_density, seed_offset=97, bias=toxin_bias, wall_mask=wall_mask
+                )
+            else:
+                toxin_mask = (
+                    torch.rand(
+                        (self.agent_batch.num_envs, self.height, self.width),
+                        device=self.device,
+                        generator=self.random_generator,
+                    )
+                    < self.toxin_density
+                )
+                if wall_mask is not None:
+                    toxin_mask = toxin_mask & (~wall_mask)
 
         existing_toxin = (self.map_state & BIT_TOXIN).bool()
         if food_mask is not None:
