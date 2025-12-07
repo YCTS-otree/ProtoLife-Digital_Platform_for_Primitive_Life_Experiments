@@ -18,7 +18,7 @@ from protolife.config_loader import load_config
 from protolife.checkpoint import load_checkpoint, save_checkpoint
 from protolife.env import ProtoLifeEnv
 from protolife.policy import action_space, build_policy
-from protolife.utils.seed_utils import set_seed
+from protolife.utils.seed_utils import generate_seed, set_seed
 
 
 TRAIN_DEFAULTS = {
@@ -77,6 +77,17 @@ def _merge_dict(default: dict, override: dict) -> dict:
     return result
 
 
+def _resolve_random_seed(config: dict, default_config: dict) -> int:
+    world_cfg = config.setdefault("world", {})
+    seed = world_cfg.get("random_seed")
+    if seed is None:
+        seed = default_config.get("world", {}).get("random_seed")
+    if seed is None:
+        seed = generate_seed()
+    world_cfg["random_seed"] = seed
+    return seed
+
+
 def _prepare_model_dir(args: argparse.Namespace, fallback_tag: str) -> tuple[Path, str]:
     root = Path("model")
     root.mkdir(exist_ok=True)
@@ -133,12 +144,14 @@ def main() -> None:
         existing_model_config = yaml.safe_load(model_config_path.read_text(encoding="utf-8")) or {}
 
     config = _merge_dict(existing_model_config, config)
+    resolved_seed = _resolve_random_seed(config, default_config)
     merged_config = _merge_dict(default_config, config)
+    merged_config.setdefault("world", {})["random_seed"] = resolved_seed
     model_config_path.write_text(yaml.safe_dump(merged_config, allow_unicode=True), encoding="utf-8")
     print(f"模型目录: {model_dir.resolve()}")
     print(f"配置文件: {config_path.resolve()}")
     print(f"Checkpoint 目录: {checkpoint_dir.resolve()}")
-    set_seed(get_cfg(config, default_config, "world", "random_seed", 0))
+    set_seed(resolved_seed)
 
     env = ProtoLifeEnv(config, default_config)
     policy = build_policy(config, default_config, obs_dim=env.observation_dim).to(env.device)

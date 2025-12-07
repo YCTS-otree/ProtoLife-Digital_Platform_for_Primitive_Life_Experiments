@@ -15,3 +15,9 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def generate_seed() -> int:
+    """生成一个 32 位整型随机种子。"""
+
+    return random.SystemRandom().randint(0, 2**32 - 1)
