@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 
 from .agents import AgentBatch
+from .communication import broadcast_messages
 from .encoding import (
     BIT_BUILDABLE,
     BIT_FOOD,
@@ -23,6 +24,7 @@ from .encoding import (
     encode_grid,
     load_hex_map,
 )
+from .genetics import can_reproduce
 from .rewards import build_action_reward_table
 
 
@@ -54,6 +56,8 @@ ENV_DEFAULTS = {
         "base_health": 100,
         "base_metabolism_cost": 1.0,
         "move_cost": 0.2,
+        "reproduction_energy_threshold": 80,
+        "child_energy_fraction": 0.3,
     },
     "training": {"num_envs": 32, "rollout_steps": 128},
     "logging": {"realtime_render": False},
@@ -71,6 +75,9 @@ ENV_DEFAULTS = {
         "vision_decay_mode": "linear",
         "vision_decay_coefficient": 1.0,
     },
+    "communication": {"radius": 2, "base_strength": 1.0},
+    "combat": {"damage": 10.0, "radius": 2.0, "decay": "none"},
+    "reproduction": {"health_cost": 5.0},
 }
 
 
@@ -182,6 +189,65 @@ class ProtoLifeEnv:
         rewards = rewards.clone()
         energy = self.agent_batch.state["energy"]
         health = self.agent_batch.state["health"]
+        x = self.agent_batch.state["x"]
+        y = self.agent_batch.state["y"]
+
+        # 通信：按距离对数衰减聚合信号
+        self.agent_batch.state["comm"].zero_()
+        if self._get("features", "use_communication", True):
+            comm_radius = float(
+                self._get("communication", "radius", ENV_DEFAULTS["communication"]["radius"])
+            )
+            comm_strength = float(
+                self._get(
+                    "communication",
+                    "base_strength",
+                    ENV_DEFAULTS["communication"]["base_strength"],
+                )
+            )
+            comm_mask = actions_2d == 7
+            if comm_mask.any() and comm_radius > 0:
+                positions = torch.stack([x, y], dim=-1)
+                messages = torch.where(
+                    comm_mask.unsqueeze(-1),
+                    torch.ones_like(self.agent_batch.state["comm"]),
+                    torch.zeros_like(self.agent_batch.state["comm"]),
+                )
+                aggregated = broadcast_messages(messages, positions, comm_radius, comm_strength)
+                self.agent_batch.state["comm"] = aggregated
+
+        # 攻击：按距离衰减伤害
+        if self._get("features", "use_combat", True):
+            attack_mask = actions_2d == 6
+            if attack_mask.any():
+                attack_radius = float(
+                    self._get("combat", "radius", ENV_DEFAULTS["combat"]["radius"])
+                )
+                attack_damage = float(
+                    self._get("combat", "damage", ENV_DEFAULTS["combat"]["damage"])
+                )
+                decay_mode = str(
+                    self._get("combat", "decay", ENV_DEFAULTS["combat"]["decay"])
+                ).lower()
+                positions = torch.stack([x, y], dim=-1).float()
+                distances = torch.cdist(positions, positions, p=2)
+                valid = (distances <= attack_radius) & (distances > 0)
+
+                if decay_mode == "log":
+                    damage_scale = attack_damage / (
+                        1.0 + torch.log1p(torch.clamp(distances, min=1e-6))
+                    )
+                elif decay_mode == "linear":
+                    damage_scale = attack_damage * torch.clamp(
+                        1.0 - distances / max(attack_radius, 1e-6), min=0.0
+                    )
+                else:
+                    damage_scale = torch.where(valid, torch.full_like(distances, attack_damage), torch.zeros_like(distances))
+
+                damage_scale = torch.where(valid, damage_scale, torch.zeros_like(damage_scale))
+                attacker_mask = attack_mask.unsqueeze(1).expand_as(damage_scale)
+                total_damage = (attacker_mask * damage_scale).sum(dim=1)
+                health.sub_(total_damage)
 
         # 基础代谢与移动消耗
         base_metabolism = self._get("agents", "base_metabolism_cost", ENV_DEFAULTS["agents"]["base_metabolism_cost"])
@@ -192,10 +258,57 @@ class ProtoLifeEnv:
         # 撞墙轻微惩罚
         rewards = torch.where(move_info["collided"], rewards - 0.6, rewards)
 
+        # 繁衍：满足能量阈值时在空闲插槽生成子代，并扣除健康值
+        if self._get("features", "use_reproduction", True):
+            reproduction_mask = actions_2d == 10
+            threshold = self._get(
+                "agents",
+                "reproduction_energy_threshold",
+                ENV_DEFAULTS["agents"]["reproduction_energy_threshold"],
+            )
+            child_fraction = self._get(
+                "agents", "child_energy_fraction", ENV_DEFAULTS["agents"]["child_energy_fraction"]
+            )
+            health_cost = self._get(
+                "reproduction", "health_cost", ENV_DEFAULTS["reproduction"]["health_cost"]
+            )
+            eligible = reproduction_mask & can_reproduce(energy, threshold)
+
+            for env_idx in range(self.agent_batch.num_envs):
+                parents = torch.nonzero(eligible[env_idx], as_tuple=False).view(-1)
+                if parents.numel() == 0:
+                    continue
+                dead_slots = torch.nonzero(
+                    (energy[env_idx] <= 0) | (health[env_idx] <= 0), as_tuple=False
+                ).view(-1)
+                if dead_slots.numel() == 0:
+                    continue
+
+                for parent_idx in parents:
+                    if dead_slots.numel() == 0:
+                        break
+                    child_idx = dead_slots[0]
+                    dead_slots = dead_slots[1:]
+
+                    transfer_energy = energy[env_idx, parent_idx] * child_fraction
+                    energy[env_idx, parent_idx] -= transfer_energy
+                    energy[env_idx, child_idx] = transfer_energy
+                    health[env_idx, parent_idx] -= health_cost
+                    health[env_idx, child_idx] = self._get(
+                        "agents", "base_health", ENV_DEFAULTS["agents"]["base_health"]
+                    )
+                    x[env_idx, child_idx] = x[env_idx, parent_idx]
+                    y[env_idx, child_idx] = y[env_idx, parent_idx]
+                    self.agent_batch.state["age"][env_idx, child_idx] = 0
+                    self.agent_batch.state["generation"][env_idx, child_idx] = (
+                        self.agent_batch.state["generation"][env_idx, parent_idx] + 1
+                    )
+                    self.agent_batch.state["genome_id"][env_idx, child_idx] = self.agent_batch.state[
+                        "genome_id"
+                    ][env_idx, parent_idx]
+
         # 交互：食物/毒素
         env_ids = torch.arange(self.agent_batch.num_envs, device=self.device).unsqueeze(1).expand_as(actions_2d)
-        x = self.agent_batch.state["x"]
-        y = self.agent_batch.state["y"]
         current_cells = self.map_state[env_ids, y, x]
 
         if self._get("rewards", "enable_proximity_reward", ENV_DEFAULTS["rewards"]["enable_proximity_reward"]):

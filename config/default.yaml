@@ -34,6 +34,20 @@ agents:
   communication_cost: 0.1  # 通信能量消耗（预留）
   reproduction_energy_threshold: 80  # 繁衍能量阈值
   child_energy_fraction: 0.3  # 子代获得的亲代能量比例
+  reproduction_health_cost: 5.0  # 成功繁衍后父代扣除的健康值
+
+# 通信/战斗参数
+communication:
+  radius: 2  # 信号作用半径
+  base_strength: 1.0  # 信号初始强度，对数衰减
+
+combat:
+  damage: 10.0  # 基础伤害
+  radius: 2.0   # 伤害半径
+  decay: log    # 衰减模式：false/none、log、linear
+
+reproduction:
+  health_cost: 5.0  # 繁衍成功后父代扣除的健康值
 
 # 训练超参与调试开关
 training:
