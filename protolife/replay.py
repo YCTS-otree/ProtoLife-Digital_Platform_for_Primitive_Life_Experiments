@@ -121,6 +121,21 @@ def _select_pairs(pairs: List[Tuple[Path, Path]]) -> List[Tuple[Path, Path]]:
     return sorted(pairs, key=lambda p: p[0].stat().st_mtime)
 
 
+def _resolve_marker_size(reader: ReplayReader, fallback: float = 10.0) -> float:
+    """从日志元数据中解析个体散点尺寸。"""
+
+    for meta in (reader.metadata, reader.agent_metadata):
+        if not meta:
+            continue
+        size = meta.get("agent_marker_size")
+        if size is not None:
+            try:
+                return float(size)
+            except (TypeError, ValueError):
+                break
+    return float(fallback)
+
+
 def playback(target: str, interval: float = 0.2) -> None:
     """使用 matplotlib 实时回放日志文件，支持目录或模型路径。"""
 
@@ -135,6 +150,7 @@ def playback(target: str, interval: float = 0.2) -> None:
 
     for map_log, agent_log in pairs:
         reader = ReplayReader(map_log, agent_log)
+        marker_size = _resolve_marker_size(reader)
         try:
             height, width = _extract_expected_shape(reader.metadata)
         except ValueError:
@@ -168,7 +184,7 @@ def playback(target: str, interval: float = 0.2) -> None:
                 artist.remove()
             xs = agent_state[..., 0].view(-1)
             ys = agent_state[..., 1].view(-1)
-            ax.scatter(xs, ys, c="red", s=10)
+            ax.scatter(xs, ys, c="red", s=marker_size)
             ax.set_title(f"step {agent_data.get('step', 0)} | {map_log.name}")
             plt.pause(interval)
 
