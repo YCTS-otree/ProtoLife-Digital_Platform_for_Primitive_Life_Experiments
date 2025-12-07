@@ -193,6 +193,7 @@ def main() -> None:
             metadata={
                 "height": env.height,
                 "width": env.width,
+                "agent_marker_size": env.agent_marker_size,
                 "num_envs": env.agent_batch.num_envs,
                 "agents_per_env": env.agent_batch.agents_per_env,
                 "run_name": model_dir.name,

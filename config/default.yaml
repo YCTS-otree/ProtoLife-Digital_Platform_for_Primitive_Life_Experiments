@@ -78,6 +78,7 @@ logging:
   realtime_render: true  # 是否开启实时渲染
   save_dir: runs/default  # 日志目录
   env_index: 0  # 多环境时选择写入第几个环境的快照
+  agent_marker_size: 20  # 实时/回放中个体散点尺寸（matplotlib scatter 的 s）
 
 # 动作基础奖励表
 action_rewards:

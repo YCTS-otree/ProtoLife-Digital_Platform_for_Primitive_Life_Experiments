@@ -60,7 +60,7 @@ ENV_DEFAULTS = {
         "child_energy_fraction": 0.3,
     },
     "training": {"num_envs": 32, "rollout_steps": 128},
-    "logging": {"realtime_render": False},
+    "logging": {"realtime_render": False, "agent_marker_size": 10},
     "rewards": {
         "survival_reward": 0.0001,
         "food_reward": 1.0,
@@ -141,8 +141,17 @@ class ProtoLifeEnv:
             (self.agent_batch.num_envs, self.height, self.width), dtype=torch.int64, device=self.device
         )
         self.renderer = None
+        self.agent_marker_size = self._get(
+            "logging",
+            "agent_marker_size",
+            ENV_DEFAULTS["logging"]["agent_marker_size"],
+        )
         if self._get("logging", "realtime_render", ENV_DEFAULTS["logging"]["realtime_render"]):
-            self.renderer = GridRenderer(self.height, self.width)
+            self.renderer = GridRenderer(
+                self.height,
+                self.width,
+                agent_marker_size=self.agent_marker_size,
+            )
 
         self.observation_dim = self._calculate_observation_dim()
         self.step_count = 0
@@ -771,9 +780,10 @@ class ProtoLifeEnv:
 class GridRenderer:
     """基于 matplotlib 的简易实时可视化，与 map_editor 交互风格一致。"""
 
-    def __init__(self, height: int, width: int) -> None:
+    def __init__(self, height: int, width: int, *, agent_marker_size: float = 10) -> None:
         self.height = height
         self.width = width
+        self.agent_marker_size = agent_marker_size
         plt.ion()
         self.fig, self.ax = plt.subplots()
         self.img = None
@@ -798,5 +808,5 @@ class GridRenderer:
             artist.remove()
         xs = agent_state["x"][0].cpu()
         ys = agent_state["y"][0].cpu()
-        self.ax.scatter(xs, ys, c="red", s=10)
+        self.ax.scatter(xs, ys, c="red", s=self.agent_marker_size)
         plt.pause(0.001)
