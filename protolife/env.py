@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -25,7 +26,7 @@ from .encoding import (
     load_hex_map,
 )
 from .genetics import can_reproduce
-from .rewards import build_action_reward_table
+from .rewards import build_action_energy_cost_table, build_action_reward_table
 
 
 ENV_DEFAULTS = {
@@ -54,13 +55,21 @@ ENV_DEFAULTS = {
         "per_env": 32,
         "base_energy": 50,
         "base_health": 100,
+        "energy_max": 100,
+        "health_max": 100,
         "base_metabolism_cost": 1.0,
         "move_cost": 0.2,
         "reproduction_energy_threshold": 80,
         "child_energy_fraction": 0.3,
     },
     "training": {"num_envs": 32, "rollout_steps": 128},
-    "logging": {"realtime_render": False, "agent_marker_size": 10},
+    "logging": {
+        "realtime_render": False,
+        "agent_marker_size": 10,
+        "snapshot_gpu_stage": False,
+        "snapshot_flush_interval": 8,
+        "show_step": True,
+    },
     "rewards": {
         "survival_reward": 0.0001,
         "food_reward": 1.0,
@@ -74,6 +83,20 @@ ENV_DEFAULTS = {
         "stand_on_food_reward": 0.02,
         "vision_decay_mode": "linear",
         "vision_decay_coefficient": 1.0,
+        "energy_fit_threshold": 50.0,
+        "energy_reward_at_fit": 0.05,
+        "energy_reward_at_extreme": -0.05,
+        "energy_reward_mode": "linear",
+        "energy_reward_coefficient": 1.0,
+        "health_reward_at_max": 0.05,
+        "health_reward_at_zero": -0.2,
+        "health_reward_mode": "linear",
+        "health_reward_coefficient": 1.0,
+        "health_recovery_energy_threshold": 40.0,
+        "health_recovery_per_step": 0.5,
+        "health_decay_min": -1.0,
+        "health_decay_mode": "linear",
+        "health_decay_coefficient": 1.0,
     },
     "communication": {"radius": 2, "base_strength": 1.0},
     "combat": {"damage": 10.0, "radius": 2.0, "decay": "none"},
@@ -126,8 +149,82 @@ class ProtoLifeEnv:
             "toxin_lifetime",
             self._get("world", "toxin_decay_steps", 0),
         )
+        self.energy_max = float(self._get("agents", "energy_max", ENV_DEFAULTS["agents"]["energy_max"]))
+        self.health_max = float(self._get("agents", "health_max", ENV_DEFAULTS["agents"]["health_max"]))
+        self.energy_reward_fit = float(
+            self._get("rewards", "energy_fit_threshold", ENV_DEFAULTS["rewards"]["energy_fit_threshold"])
+        )
+        self.energy_reward_at_fit = float(
+            self._get(
+                "rewards",
+                "energy_reward_at_fit",
+                ENV_DEFAULTS["rewards"]["energy_reward_at_fit"],
+            )
+        )
+        self.energy_reward_extreme = float(
+            self._get(
+                "rewards",
+                "energy_reward_at_extreme",
+                ENV_DEFAULTS["rewards"]["energy_reward_at_extreme"],
+            )
+        )
+        self.energy_reward_mode = str(
+            self._get("rewards", "energy_reward_mode", ENV_DEFAULTS["rewards"]["energy_reward_mode"])
+        ).lower()
+        self.energy_reward_coefficient = float(
+            self._get(
+                "rewards",
+                "energy_reward_coefficient",
+                ENV_DEFAULTS["rewards"]["energy_reward_coefficient"],
+            )
+        )
+        self.health_reward_at_max = float(
+            self._get("rewards", "health_reward_at_max", ENV_DEFAULTS["rewards"]["health_reward_at_max"])
+        )
+        self.health_reward_at_zero = float(
+            self._get("rewards", "health_reward_at_zero", ENV_DEFAULTS["rewards"]["health_reward_at_zero"])
+        )
+        self.health_reward_mode = str(
+            self._get("rewards", "health_reward_mode", ENV_DEFAULTS["rewards"]["health_reward_mode"])
+        ).lower()
+        self.health_reward_coefficient = float(
+            self._get(
+                "rewards",
+                "health_reward_coefficient",
+                ENV_DEFAULTS["rewards"]["health_reward_coefficient"],
+            )
+        )
+        self.health_recovery_energy_threshold = float(
+            self._get(
+                "rewards",
+                "health_recovery_energy_threshold",
+                ENV_DEFAULTS["rewards"]["health_recovery_energy_threshold"],
+            )
+        )
+        self.health_recovery_per_step = float(
+            self._get(
+                "rewards",
+                "health_recovery_per_step",
+                ENV_DEFAULTS["rewards"]["health_recovery_per_step"],
+            )
+        )
+        self.health_decay_min = float(
+            self._get("rewards", "health_decay_min", ENV_DEFAULTS["rewards"]["health_decay_min"])
+        )
+        self.health_decay_mode = str(
+            self._get("rewards", "health_decay_mode", ENV_DEFAULTS["rewards"]["health_decay_mode"])
+        ).lower()
+        self.health_decay_coefficient = float(
+            self._get(
+                "rewards",
+                "health_decay_coefficient",
+                ENV_DEFAULTS["rewards"]["health_decay_coefficient"],
+            )
+        )
         action_reward_cfg = config.get("action_rewards", self.default_config.get("action_rewards", {}))
         self.action_rewards = build_action_reward_table(action_reward_cfg).to(self.device)
+        action_energy_cfg = config.get("action_energy_costs", self.default_config.get("action_energy_costs", {}))
+        self.action_energy_costs = build_action_energy_cost_table(action_energy_cfg).to(self.device)
         self.agent_batch = AgentBatch(
             num_envs=self._get("training", "num_envs", ENV_DEFAULTS["training"]["num_envs"]),
             agents_per_env=self._get("agents", "per_env", ENV_DEFAULTS["agents"]["per_env"]),
@@ -146,11 +243,13 @@ class ProtoLifeEnv:
             "agent_marker_size",
             ENV_DEFAULTS["logging"]["agent_marker_size"],
         )
+        self.show_step = bool(self._get("logging", "show_step", ENV_DEFAULTS["logging"]["show_step"]))
         if self._get("logging", "realtime_render", ENV_DEFAULTS["logging"]["realtime_render"]):
             self.renderer = GridRenderer(
                 self.height,
                 self.width,
                 agent_marker_size=self.agent_marker_size,
+                show_step=self.show_step,
             )
 
         self.observation_dim = self._calculate_observation_dim()
@@ -176,6 +275,8 @@ class ProtoLifeEnv:
             self.width,
             base_energy=self._get("agents", "base_energy", ENV_DEFAULTS["agents"]["base_energy"]),
             base_health=self._get("agents", "base_health", ENV_DEFAULTS["agents"]["base_health"]),
+            energy_max=self.energy_max,
+            health_max=self.health_max,
         )
         return self._build_observations()
 
@@ -261,7 +362,8 @@ class ProtoLifeEnv:
         # 基础代谢与移动消耗
         base_metabolism = self._get("agents", "base_metabolism_cost", ENV_DEFAULTS["agents"]["base_metabolism_cost"])
         move_cost = self._get("agents", "move_cost", ENV_DEFAULTS["agents"]["move_cost"])
-        energy_cost = base_metabolism + move_cost * move_info["moved"].float()
+        action_cost = self.action_energy_costs[actions_2d]
+        energy_cost = base_metabolism + move_cost * move_info["moved"].float() + action_cost
         energy.sub_(energy_cost)
 
         # 撞墙轻微惩罚
@@ -400,6 +502,14 @@ class ProtoLifeEnv:
             health,
         )
 
+        health = self._update_health_from_energy(health, energy)
+
+        energy = torch.clamp(energy, min=0.0, max=self.energy_max)
+        health = torch.clamp(health, min=0.0, max=self.health_max)
+
+        rewards = rewards + self._compute_energy_reward(energy)
+        rewards = rewards + self._compute_health_reward(health)
+
         self.agent_batch.state["energy"] = energy
         self.agent_batch.state["health"] = health
 
@@ -420,9 +530,102 @@ class ProtoLifeEnv:
 
         observations = self._build_observations()
         if self.renderer:
-            self.renderer.render(self.map_state[0], self.agent_batch.state)
+            self.renderer.render(self.map_state[0], self.agent_batch.state, step=self.step_count)
 
         return EnvStepResult(observations=observations, rewards=rewards.view(-1), dones=dones.view(-1), infos=infos)
+
+    def _apply_curve(self, normalized: torch.Tensor, mode: str, coefficient: float) -> torch.Tensor:
+        """根据模式调整 [0,1] 归一化值的曲线形状。"""
+
+        normalized = torch.clamp(normalized, 0.0, 1.0)
+        coeff = max(float(coefficient), 1e-6)
+        if mode == "log":
+            return torch.log1p(coeff * normalized) / math.log1p(coeff)
+        if mode in {"invlog", "inverse_log"}:
+            return torch.expm1(coeff * normalized) / math.expm1(coeff)
+        return normalized
+
+    def _interpolate_reward(
+        self, normalized: torch.Tensor, start_value: float, end_value: float, mode: str, coefficient: float
+    ) -> torch.Tensor:
+        curve = self._apply_curve(normalized, mode, coefficient)
+        return start_value + curve * (end_value - start_value)
+
+    def _compute_energy_reward(self, energy: torch.Tensor) -> torch.Tensor:
+        if self.energy_max <= 0:
+            return torch.zeros_like(energy)
+
+        rewards = torch.zeros_like(energy)
+        upper_mask = energy >= self.energy_reward_fit
+        lower_mask = energy < self.energy_reward_fit
+
+        if upper_mask.any() and self.energy_max > self.energy_reward_fit:
+            normalized_upper = torch.clamp(
+                (energy[upper_mask] - self.energy_reward_fit) / max(self.energy_max - self.energy_reward_fit, 1e-6),
+                0.0,
+                1.0,
+            )
+            rewards_upper = self._interpolate_reward(
+                normalized_upper,
+                self.energy_reward_at_fit,
+                self.energy_reward_extreme,
+                self.energy_reward_mode,
+                self.energy_reward_coefficient,
+            )
+            rewards = rewards.masked_scatter(upper_mask, rewards_upper)
+
+        if lower_mask.any() and self.energy_reward_fit > 0:
+            normalized_lower = torch.clamp(
+                (self.energy_reward_fit - energy[lower_mask]) / max(self.energy_reward_fit, 1e-6),
+                0.0,
+                1.0,
+            )
+            rewards_lower = self._interpolate_reward(
+                normalized_lower,
+                self.energy_reward_at_fit,
+                self.energy_reward_extreme,
+                self.energy_reward_mode,
+                self.energy_reward_coefficient,
+            )
+            rewards = rewards.masked_scatter(lower_mask, rewards_lower)
+
+        return rewards
+
+    def _compute_health_reward(self, health: torch.Tensor) -> torch.Tensor:
+        if self.health_max <= 0:
+            return torch.zeros_like(health)
+
+        normalized = torch.clamp((self.health_max - health) / max(self.health_max, 1e-6), 0.0, 1.0)
+        return self._interpolate_reward(
+            normalized,
+            self.health_reward_at_max,
+            self.health_reward_at_zero,
+            self.health_reward_mode,
+            self.health_reward_coefficient,
+        )
+
+    def _update_health_from_energy(self, health: torch.Tensor, energy: torch.Tensor) -> torch.Tensor:
+        if self.health_recovery_energy_threshold <= 0:
+            return health
+
+        recovery_mask = energy > self.health_recovery_energy_threshold
+        if recovery_mask.any() and self.health_recovery_per_step != 0:
+            health = torch.where(recovery_mask, health + self.health_recovery_per_step, health)
+
+        decay_mask = energy < self.health_recovery_energy_threshold
+        if decay_mask.any() and self.health_decay_min != 0:
+            normalized = torch.clamp(
+                (self.health_recovery_energy_threshold - energy[decay_mask])
+                / max(self.health_recovery_energy_threshold, 1e-6),
+                0.0,
+                1.0,
+            )
+            decay_scale = self._apply_curve(normalized, self.health_decay_mode, self.health_decay_coefficient)
+            scaled_decay = torch.zeros_like(health)
+            scaled_decay[decay_mask] = decay_scale * self.health_decay_min
+            health = health + scaled_decay
+
+        return health
 
     def _build_observations(self) -> Dict[str, torch.Tensor]:
         """构建供策略网络使用的张量观测。"""
@@ -757,8 +960,8 @@ class ProtoLifeEnv:
 
         x = agent_state[..., 0] / max(self.width - 1, 1)
         y = agent_state[..., 1] / max(self.height - 1, 1)
-        energy = agent_state[..., 2] / max(self._get("agents", "base_energy", ENV_DEFAULTS["agents"]["base_energy"]), 1)
-        health = agent_state[..., 3] / max(self._get("agents", "base_health", ENV_DEFAULTS["agents"]["base_health"]), 1)
+        energy = agent_state[..., 2] / max(self.energy_max, 1)
+        health = agent_state[..., 3] / max(self.health_max, 1)
         age = agent_state[..., 4] / max(self._get("training", "rollout_steps", ENV_DEFAULTS["training"]["rollout_steps"]), 1)
         return torch.stack([x, y, energy, health, age], dim=-1)
 
@@ -780,10 +983,11 @@ class ProtoLifeEnv:
 class GridRenderer:
     """基于 matplotlib 的简易实时可视化，与 map_editor 交互风格一致。"""
 
-    def __init__(self, height: int, width: int, *, agent_marker_size: float = 10) -> None:
+    def __init__(self, height: int, width: int, *, agent_marker_size: float = 10, show_step: bool = True) -> None:
         self.height = height
         self.width = width
         self.agent_marker_size = agent_marker_size
+        self.show_step = show_step
         plt.ion()
         self.fig, self.ax = plt.subplots()
         self.img = None
@@ -798,7 +1002,7 @@ class GridRenderer:
         display = torch.where((grid & BIT_RESOURCE) > 0, torch.tensor(0.6), display)
         return display
 
-    def render(self, grid: torch.Tensor, agent_state: Dict[str, torch.Tensor]) -> None:
+    def render(self, grid: torch.Tensor, agent_state: Dict[str, torch.Tensor], *, step: int | None = None) -> None:
         display = self._to_display(grid.cpu())
         if self.img is None:
             self.img = self.ax.imshow(display, cmap="viridis", vmin=0, vmax=1)
@@ -809,4 +1013,6 @@ class GridRenderer:
         xs = agent_state["x"][0].cpu()
         ys = agent_state["y"][0].cpu()
         self.ax.scatter(xs, ys, c="red", s=self.agent_marker_size)
+        if self.show_step and step is not None:
+            self.ax.set_title(f"Step: {step}")
         plt.pause(0.001)

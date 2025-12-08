@@ -44,13 +44,23 @@ class AgentBatch:
             "generation": torch.zeros(shape, dtype=torch.int64, device=self.device),
         }
 
-    def reset(self, height: int, width: int, base_energy: float = 50, base_health: float = 100) -> None:
+    def reset(
+        self,
+        height: int,
+        width: int,
+        base_energy: float = 50,
+        base_health: float = 100,
+        energy_max: float | None = None,
+        health_max: float | None = None,
+    ) -> None:
         """随机初始化个体位置与基本状态。"""
 
         self.state["x"].random_(0, width)
         self.state["y"].random_(0, height)
-        self.state["energy"].fill_(base_energy)
-        self.state["health"].fill_(base_health)
+        energy_value = base_energy if energy_max is None else min(base_energy, energy_max)
+        health_value = base_health if health_max is None else min(base_health, health_max)
+        self.state["energy"].fill_(energy_value)
+        self.state["health"].fill_(health_value)
         self.state["age"].zero_()
         self.state["mood"].zero_()
         self.state["comm"].zero_()

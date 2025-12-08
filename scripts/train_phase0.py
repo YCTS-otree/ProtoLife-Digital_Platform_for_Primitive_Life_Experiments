@@ -201,6 +201,12 @@ def main() -> None:
                 "map_file": env.map_file,
                 "toxin_lifetime": getattr(env, "toxin_lifetime", None),
             },
+            buffer_on_gpu=get_cfg(
+                config, default_config, "logging", "snapshot_gpu_stage", False
+            ),
+            flush_interval=get_cfg(
+                config, default_config, "logging", "snapshot_flush_interval", 8
+            ),
         )
 
     checkpoint_dir = Path(checkpoint_dir)
@@ -326,6 +332,9 @@ def main() -> None:
                 meta={"step": total_steps},
             )
             print(f"已保存 checkpoint 至 {checkpoint_dir}, step={total_steps}")
+
+    if logger:
+        logger.flush()
 
     print("训练完成，最终奖励均值:", step_result.rewards.mean().item())
 

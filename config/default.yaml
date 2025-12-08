@@ -28,7 +28,9 @@ model:
 agents:
   per_env: 4  # 每个环境中的个体数
   base_energy: 50  # 初始能量
+  energy_max: 100  # 能量上限
   base_health: 100  # 初始健康
+  health_max: 100  # 健康上限
   base_metabolism_cost: 0.1  # 每步基础代谢消耗
   move_cost: 0.1  # 移动额外能量消耗
   communication_cost: 0.1  # 通信能量消耗（预留）
@@ -79,6 +81,9 @@ logging:
   save_dir: runs/default  # 日志目录
   env_index: 0  # 多环境时选择写入第几个环境的快照
   agent_marker_size: 20  # 实时/回放中个体散点尺寸（matplotlib scatter 的 s）
+  snapshot_gpu_stage: true  # 是否先将快照留在 GPU，批量写回 CPU
+  snapshot_flush_interval: 8  # GPU 暂存的快照数量，达到后批量写回
+  show_step: true  # 实时渲染时是否展示 step 计数
 
 # 动作基础奖励表
 action_rewards:
@@ -90,6 +95,17 @@ action_rewards:
   BUILD: 0.02
   REMOVE: 0.02
   REPRODUCE: 0.05
+
+# 动作能量消耗表
+action_energy_costs:
+  STAY: 0.0
+  MOVE: 0.05
+  EAT: 0.02
+  ATTACK: 0.5
+  COMMUNICATE: 0.2
+  BUILD: 0.3
+  REMOVE: 0.2
+  REPRODUCE: 1.0
 
 # 额外奖励/惩罚系数
 rewards:
@@ -105,3 +121,17 @@ rewards:
   stand_on_food_reward: 0.03      # 踩在食物格上的基础奖励
   vision_decay_mode: log       # 距离衰减模式：linear 或 log
   vision_decay_coefficient: 1.0   # 距离衰减系数（随距离增大奖励降低）
+  energy_fit_threshold: 50.0      # 能量奖励的拐点能量值
+  energy_reward_at_fit: 0.05      # 能量处于拐点时的奖励
+  energy_reward_at_extreme: -0.05  # 能量达到极端（0 或最大）时的奖励
+  energy_reward_mode: linear      # 能量奖励曲线模式：linear/log/invlog
+  energy_reward_coefficient: 1.0  # 能量奖励曲线系数
+  health_reward_at_max: 0.05      # 健康达到最大值时的奖励
+  health_reward_at_zero: -0.2     # 健康为 0 时的奖励
+  health_reward_mode: linear      # 健康奖励曲线模式：linear/log/invlog
+  health_reward_coefficient: 1.0  # 健康奖励曲线系数
+  health_recovery_energy_threshold: 40.0  # 高于该能量时按固定值恢复健康
+  health_recovery_per_step: 0.5            # 健康每步恢复量
+  health_decay_min: -1.0                   # 能量为 0 时健康衰减的最小值（负数）
+  health_decay_mode: linear                # 低能量健康衰减曲线模式：linear/log/invlog
+  health_decay_coefficient: 1.0            # 低能量健康衰减曲线系数
