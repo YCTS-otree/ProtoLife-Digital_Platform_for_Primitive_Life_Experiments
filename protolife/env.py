@@ -50,7 +50,14 @@ ENV_DEFAULTS = {
             "toxin_bias": 0.0,
         },
     },
-    "model": {"observation_radius": 2},
+    "model": {
+        "observation_radius": 2,
+        "use_cnn": False,
+        "cnn_channels": [32, 64],
+        "cnn_feature_dim": 128,
+        "rnn_hidden_dim": 128,
+        "rnn_type": "gru",
+    },
     "agents": {
         "per_env": 32,
         "base_energy": 50,
@@ -225,10 +232,14 @@ class ProtoLifeEnv:
         self.action_rewards = build_action_reward_table(action_reward_cfg).to(self.device)
         action_energy_cfg = config.get("action_energy_costs", self.default_config.get("action_energy_costs", {}))
         self.action_energy_costs = build_action_energy_cost_table(action_energy_cfg).to(self.device)
+        self.rnn_hidden_dim = int(self._get("model", "rnn_hidden_dim", 0))
+        self.rnn_type = str(self._get("model", "rnn_type", "gru")).lower()
         self.agent_batch = AgentBatch(
             num_envs=self._get("training", "num_envs", ENV_DEFAULTS["training"]["num_envs"]),
             agents_per_env=self._get("agents", "per_env", ENV_DEFAULTS["agents"]["per_env"]),
             device=self.device,
+            memory_dim=self.rnn_hidden_dim,
+            use_lstm=self.rnn_type == "lstm",
         )
         self._map_template = self._load_map_template().to(self.device)
         self.map_state = torch.zeros(
@@ -250,7 +261,12 @@ class ProtoLifeEnv:
                 self.width,
                 agent_marker_size=self.agent_marker_size,
                 show_step=self.show_step,
-            )
+        )
+
+        self.base_patch_channels = 6  # terrain/buildable/food/toxin/resource/agents
+        self.self_channel_count = 1
+        self.patch_channels = self.base_patch_channels + self.self_channel_count
+        self.patch_shape = (self.patch_channels, 2 * self.observation_radius + 1, 2 * self.observation_radius + 1)
 
         self.observation_dim = self._calculate_observation_dim()
         self.step_count = 0
@@ -631,9 +647,9 @@ class ProtoLifeEnv:
         """构建供策略网络使用的张量观测。"""
 
         agent_state = self.agent_batch.export_state()
-        local_maps = self._extract_local_observation()
+        patch = self._extract_local_observation()
         agent_features = self._normalize_agent_features(agent_state)
-        flat_local = local_maps.contiguous().view(
+        flat_local = patch.contiguous().view(
             self.agent_batch.num_envs * self.agent_batch.agents_per_env, -1
         )
         flat_agent = agent_features.view(self.agent_batch.num_envs * self.agent_batch.agents_per_env, -1)
@@ -643,6 +659,7 @@ class ProtoLifeEnv:
             "map": self.map_state.clone(),
             "agents": agent_state,
             "agent_obs": agent_obs,
+            "patch": patch,
         }
 
     def render(self) -> None:
@@ -923,37 +940,34 @@ class ProtoLifeEnv:
         """裁剪每个体周围 r 范围内的网格并转为 multi-hot 通道。"""
 
         radius = self.observation_radius
-        # 将地图留在 GPU 上，通过 unfold + gather 一次性提取每个个体的局部区域，避免 CPU<->GPU 往返
-        padded = F.pad(
-            self.map_state.float().unsqueeze(1), (radius, radius, radius, radius)
-        )  # (E,1,H+2r,W+2r)
+        feature_map = self._build_feature_map()  # (E, C, H, W)
         kernel = 2 * radius + 1
-        patches = F.unfold(padded, kernel_size=kernel)  # (E, kernel*kernel, H*W)
+        padded = F.pad(feature_map, (radius, radius, radius, radius))  # (E, C, H+2r, W+2r)
+        patches = F.unfold(padded, kernel_size=kernel)  # (E, C*kernel*kernel, H*W)
         flat_idx = self.agent_batch.state["y"] * self.width + self.agent_batch.state["x"]  # (E, A)
-        gather_idx = flat_idx.unsqueeze(1).expand(-1, kernel * kernel, -1)
-        gathered = patches.gather(2, gather_idx)  # (E, K, A)
-        gathered = gathered.round().long().permute(0, 2, 1)  # (E, A, K)
-        channel_tensor = self._cell_to_channels(gathered)
-        return channel_tensor
+        gather_idx = flat_idx.unsqueeze(1).expand(-1, patches.size(1), -1)
+        gathered = patches.gather(2, gather_idx)  # (E, C*kernel*kernel, A)
+        gathered = gathered.permute(0, 2, 1).contiguous()  # (E, A, C*kernel*kernel)
+        patch = gathered.view(self.agent_batch.num_envs, self.agent_batch.agents_per_env, feature_map.size(1), kernel, kernel)
 
-    def _cell_to_channels(self, patch: torch.Tensor) -> torch.Tensor:
-        """将单通道 bit map 转为 multi-hot 通道。
+        self_channel = torch.zeros_like(patch[:, :, :1])
+        self_channel[:, :, 0, radius, radius] = 1.0
+        return torch.cat([patch, self_channel], dim=2)
 
-        支持输入形状：
-        - `(H, W)` 或 `(K,)` 一维 patch
-        - `(E, A, K)` 展开后的小块集合
-        输出形状与输入一致，末尾附加 channel 维度。
-        """
+    def _build_feature_map(self) -> torch.Tensor:
+        """构建多通道地图表示，包含墙/食物/毒素/资源/其他个体。"""
 
-        channels = [
-            (patch & BIT_TERRAIN_0) > 0,
-            (patch & BIT_BUILDABLE) > 0,
-            (patch & BIT_FOOD) > 0,
-            (patch & BIT_TOXIN) > 0,
-            (patch & BIT_RESOURCE) > 0,
-        ]
-        stacked = torch.stack([c.float() for c in channels], dim=-1)
-        return stacked
+        terrain = (self.map_state & BIT_TERRAIN_0).float()
+        buildable = (self.map_state & BIT_BUILDABLE).float()
+        food = (self.map_state & BIT_FOOD).float()
+        toxin = (self.map_state & BIT_TOXIN).float()
+        resource = (self.map_state & BIT_RESOURCE).float()
+
+        agent_grid = torch.zeros_like(self.map_state, dtype=torch.float32)
+        env_ids = torch.arange(self.agent_batch.num_envs, device=self.device).unsqueeze(1).expand_as(self.agent_batch.state["x"])
+        agent_grid[env_ids, self.agent_batch.state["y"], self.agent_batch.state["x"]] = 1.0
+
+        return torch.stack([terrain, buildable, food, toxin, resource, agent_grid], dim=1)
 
     def _normalize_agent_features(self, agent_state: torch.Tensor) -> torch.Tensor:
         """归一化坐标/能量/健康，避免数值尺度差异。"""
@@ -969,7 +983,7 @@ class ProtoLifeEnv:
         """计算单个 agent 的观测维度，便于构建策略网络。"""
 
         patch_cells = (2 * self.observation_radius + 1) ** 2
-        patch_channels = 5  # terrain/buildable/food/toxin/resource
+        patch_channels = self.patch_channels
         agent_feature_dim = 5
         return patch_cells * patch_channels + agent_feature_dim
 

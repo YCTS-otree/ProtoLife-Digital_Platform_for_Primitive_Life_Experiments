@@ -177,7 +177,7 @@ def main() -> None:
     set_seed(resolved_seed)
 
     env = ProtoLifeEnv(config, default_config)
-    policy = build_policy(config, default_config, obs_dim=env.observation_dim).to(env.device)
+    policy = build_policy(config, default_config, obs_dim=env.observation_dim, patch_shape=env.patch_shape).to(env.device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
 
     logger = None
@@ -256,8 +256,23 @@ def main() -> None:
     last_print_time = time.perf_counter()
     last_print_step = total_steps
     for step in range(rollout_steps):
-        flat_obs = obs["agent_obs"]
-        logits, values = policy(flat_obs)
+        if getattr(policy, "use_cnn", False):
+            patches = obs["patch"]
+            memory_state = env.agent_batch.state.get("memory")
+            if env.agent_batch.use_lstm:
+                memory_cell = env.agent_batch.state.get("memory_cell")
+                hidden = (memory_state, memory_cell) if memory_state is not None else None
+            else:
+                hidden = memory_state
+            logits, values, new_hidden = policy(patches, hidden)
+            if isinstance(new_hidden, tuple):
+                env.agent_batch.state["memory"] = new_hidden[0].detach()
+                env.agent_batch.state["memory_cell"] = new_hidden[1].detach()
+            else:
+                env.agent_batch.state["memory"] = new_hidden.detach()
+        else:
+            flat_obs = obs["agent_obs"]
+            logits, values = policy(flat_obs)
 
         if gaussian_noise_std > 0:
             logits = logits + torch.randn_like(logits) * gaussian_noise_std
@@ -280,10 +295,11 @@ def main() -> None:
         step_result = env.step(actions)
         rewards = step_result.rewards
 
-        log_probs = dist.log_prob(actions)
+        log_probs = dist.log_prob(actions).view(-1)
         entropy = dist.entropy().mean()
+        predicted_values = values.view(-1)
         policy_loss = -(rewards.detach() * log_probs).mean()
-        value_loss = 0.5 * ((values.squeeze(-1) - rewards.detach()) ** 2).mean()
+        value_loss = 0.5 * ((predicted_values - rewards.detach()) ** 2).mean()
         entropy_loss = -entropy_coef * entropy
         loss = policy_loss + value_loss + entropy_loss
 

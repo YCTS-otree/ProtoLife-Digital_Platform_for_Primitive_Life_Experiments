@@ -22,7 +22,12 @@ world:
 # 模型结构参数
 model:
   observation_radius: 3  # 每个体可见半径 r
-  hidden: 16384  # 策略网络隐藏层宽度
+  use_cnn: true  # 是否使用 CNN+RNN 结构（默认开启，关闭时回退到简单 MLP）
+  cnn_channels: [32, 64]  # 卷积层通道数列表，可按需加深
+  cnn_feature_dim: 256  # 卷积输出展平后的线性投影维度
+  rnn_hidden_dim: 128  # GRU/LSTM 隐状态维度（同时也是 Agent 记忆张量维度）
+  rnn_type: gru  # gru 或 lstm，决定短期记忆类型
+  hidden: 16384  # MLP 回退模式下的隐藏层宽度
 
 # 个体初始与代谢参数
 agents:
