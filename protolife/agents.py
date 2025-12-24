@@ -24,15 +24,17 @@ class AgentState:
 class AgentBatch:
     """批量个体管理，便于 GPU 向量化处理。"""
 
-    def __init__(self, num_envs: int, agents_per_env: int, device: torch.device):
+    def __init__(self, num_envs: int, agents_per_env: int, device: torch.device, memory_dim: int = 0, *, use_lstm: bool = False):
         self.num_envs = num_envs
         self.agents_per_env = agents_per_env
         self.device = device
+        self.memory_dim = int(memory_dim)
+        self.use_lstm = use_lstm
         self.state = self._allocate_state()
 
     def _allocate_state(self) -> Dict[str, torch.Tensor]:
         shape = (self.num_envs, self.agents_per_env)
-        return {
+        base_state = {
             "x": torch.zeros(shape, dtype=torch.int64, device=self.device),
             "y": torch.zeros(shape, dtype=torch.int64, device=self.device),
             "energy": torch.zeros(shape, dtype=torch.float32, device=self.device),
@@ -43,6 +45,11 @@ class AgentBatch:
             "genome_id": torch.zeros(shape, dtype=torch.int64, device=self.device),
             "generation": torch.zeros(shape, dtype=torch.int64, device=self.device),
         }
+        if self.memory_dim > 0:
+            base_state["memory"] = torch.zeros(shape + (self.memory_dim,), dtype=torch.float32, device=self.device)
+            if self.use_lstm:
+                base_state["memory_cell"] = torch.zeros(shape + (self.memory_dim,), dtype=torch.float32, device=self.device)
+        return base_state
 
     def reset(
         self,
@@ -66,6 +73,10 @@ class AgentBatch:
         self.state["comm"].zero_()
         self.state["genome_id"].zero_()
         self.state["generation"].zero_()
+        if "memory" in self.state:
+            self.state["memory"].zero_()
+        if "memory_cell" in self.state:
+            self.state["memory_cell"].zero_()
 
     def apply_actions(self, actions: torch.Tensor, height: int, width: int, map_state: torch.Tensor) -> Dict[str, torch.Tensor]:
         """根据动作更新坐标，仅处理移动并返回移动/碰撞信息。"""
@@ -122,7 +133,18 @@ class AgentBatch:
         """从 checkpoint 恢复内部状态，并确保尺寸匹配当前环境。"""
 
         self.state = {k: v.to(self.device) for k, v in state_dict.items()}
-        if self.state["x"].shape != (self.num_envs, self.agents_per_env):
+        base_shape = (self.num_envs, self.agents_per_env)
+        mem_shape = base_shape + (self.memory_dim,)
+        if self.memory_dim > 0:
+            memory = self.state.get("memory")
+            if memory is None or memory.shape != mem_shape:
+                self.state["memory"] = torch.zeros(mem_shape, dtype=torch.float32, device=self.device)
+            if self.use_lstm:
+                memory_cell = self.state.get("memory_cell")
+                if memory_cell is None or memory_cell.shape != mem_shape:
+                    self.state["memory_cell"] = torch.zeros(mem_shape, dtype=torch.float32, device=self.device)
+
+        if self.state["x"].shape != base_shape:
             raise ValueError("载入的个体状态尺寸与当前设置不一致")
         self.state["x"] = self.state["x"].clamp(0, width - 1)
         self.state["y"] = self.state["y"].clamp(0, height - 1)

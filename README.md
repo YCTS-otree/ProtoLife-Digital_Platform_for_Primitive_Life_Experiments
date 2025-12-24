@@ -74,7 +74,11 @@ maps/
    - `world`：地图尺寸、随机地图中食物/毒素密度、随机种子、外部地图文件（示例：`height: 64`, `width: 64`, `map_file: maps/default_map.hex`）。如果提供了 `map_file` 且文件存在，会优先加载该地图，否则回退到随机/空白地图并按 `food_density`/`toxin_density` 撒点资源。
      Windows 路径请使用正斜杠（例如 `G:/maps/demo.hex`）或在 YAML 中写成双反斜杠（`G:\\maps\\demo.hex`），避免未转义的反斜杠导致解析错误。
    - `agents`：每个环境的个体数量、初始能量等（示例：`per_env: 4`）。
-   - `model`：`observation_radius` 控制感知范围（环境会裁剪周围 `(2r+1)^2` 的网格并拆成多通道输入），`hidden` 为 MLP 隐藏层规模。
+   - `model`：
+     - `use_cnn`: 默认开启，环境会为每个体裁剪 `(2r+1)×(2r+1)` 的局部网格并拆成多通道（墙/可建造区/食物/毒素/资源/周围其他个体 + 中心自身标记），直接送入 CNN 编码器。
+     - `cnn_channels` / `cnn_feature_dim`：控制卷积层深度与编码维度。
+     - `rnn_hidden_dim` / `rnn_type`：启用 GRU（默认）或 LSTM 作为短期记忆，隐状态会作为 Agent 侧的 `memory` 保存到 checkpoint，旧存档缺失该字段时会自动补零。
+     - `hidden`：当 `use_cnn` 关闭时回退的 MLP 隐藏层规模。
    - `training`：并行环境数、回合步数、保存间隔等训练相关参数（示例：`num_envs: 8`, `save_interval: 100`, `checkpoint_dir: checkpoints/phase0`）。
      可用 `entropy_coef` 调整策略熵正则（默认提供非零值防止动作过早塌缩），`action_noise` 下的 `gaussian_std` 与 `epsilon` 分别控制 logits 高斯噪声和 epsilon-greedy 随机探索。
      若需要调试模型的动作采样，可开启 `print_actions: true` 查看每步动作编号与含义。
@@ -90,6 +94,12 @@ maps/
     - 复制默认配置：`cp config/default.yaml config/my_exp.yaml`。
     - 按需修改上述字段；未修改的字段会沿用默认值。
     - 运行时指定：`python -m scripts.train_phase0 --config config/my_exp.yaml`。
+
+## CNN + RNN 策略模式
+- 默认 `model.use_cnn: true`，环境会为每个体在 GPU 上一次性裁剪局部网格 patch，shape 为 `(num_envs, agents_per_env, C, H, W)`，其中 `C` 包含墙/可建造区/食物/毒素/资源/其他个体以及中心“自身”指示。
+- 策略网络改为 `CNNRecurrentPolicy`：卷积编码 -> GRU/LSTM 短期记忆 -> 动作 logits 与价值输出，兼容多环境、多智能体同时运行。
+- Agent 侧新增 `memory`（以及 LSTM 时的 `memory_cell`）字段，reset 时自动清零，checkpoint 会连同地图与优化器一起保存/恢复；旧存档缺少该字段时自动补零以避免维度错误。
+- 若需要回退到旧的 MLP，占位策略，可在 YAML 中将 `model.use_cnn` 设为 `false`，其余训练入口与参数保持不变。
 
 4. **常见问题排查**
    - `ModuleNotFoundError: No module named 'torch'`：确认已在当前虚拟环境中执行 `pip install torch pyyaml`。
