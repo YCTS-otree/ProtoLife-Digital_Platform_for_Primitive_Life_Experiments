@@ -8,6 +8,7 @@ from typing import Dict, Iterator, List, Tuple
 import matplotlib.pyplot as plt
 import torch
 
+from .config_loader import load_default_config
 from .encoding import decode_grid
 
 
@@ -144,6 +145,10 @@ def playback(target: str, interval: float = 0.2) -> None:
         raise FileNotFoundError(f"未在 {target} 下找到日志文件")
 
     pairs = _select_pairs(pairs)
+    default_config = load_default_config()
+    render_cfg = default_config.get("rendering", {})
+    show_dead_markers = bool(render_cfg.get("show_dead_markers", True))
+    dead_marker_lifetime = int(render_cfg.get("dead_marker_lifetime", 64))
     plt.ion()
     fig, ax = plt.subplots()
     img = None
@@ -151,6 +156,7 @@ def playback(target: str, interval: float = 0.2) -> None:
     for map_log, agent_log in pairs:
         reader = ReplayReader(map_log, agent_log)
         marker_size = _resolve_marker_size(reader)
+        death_steps: torch.Tensor | None = None
         try:
             height, width = _extract_expected_shape(reader.metadata)
         except ValueError:
@@ -184,7 +190,29 @@ def playback(target: str, interval: float = 0.2) -> None:
                 artist.remove()
             xs = agent_state[..., 0].view(-1)
             ys = agent_state[..., 1].view(-1)
-            ax.scatter(xs, ys, c="red", s=marker_size)
+            energies = agent_state[..., 2].view(-1)
+            healths = agent_state[..., 3].view(-1)
+            alive_mask = (energies > 0) & (healths > 0)
+            ax.scatter(xs[alive_mask], ys[alive_mask], c="red", s=marker_size)
+            step = int(agent_data.get("step", 0))
+            if show_dead_markers and dead_marker_lifetime > 0:
+                if death_steps is None or death_steps.numel() != alive_mask.numel():
+                    death_steps = torch.full_like(alive_mask, -1, dtype=torch.int64)
+                died_now = (~alive_mask) & (death_steps < 0)
+                death_steps[died_now] = step
+                revived = alive_mask & (death_steps >= 0)
+                death_steps[revived] = -1
+                show_dead = (~alive_mask) & (death_steps >= 0) & (
+                    (step - death_steps) < dead_marker_lifetime
+                )
+                if show_dead.any():
+                    ax.scatter(
+                        xs[show_dead],
+                        ys[show_dead],
+                        c="red",
+                        s=marker_size,
+                        marker="x",
+                    )
             ax.set_title(f"step {agent_data.get('step', 0)} | {map_log.name}")
             plt.pause(interval)
 

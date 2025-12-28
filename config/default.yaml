@@ -140,3 +140,4 @@ rewards:
   health_decay_min: -1.0                   # 能量为 0 时健康衰减的最小值（负数）
   health_decay_mode: linear                # 低能量健康衰减曲线模式：linear/log/invlog
   health_decay_coefficient: 1.0            # 低能量健康衰减曲线系数
+  communication_receive_reward: 0.0        # 接收到通信信号的奖励

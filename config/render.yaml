@@ -1,0 +1,3 @@
+rendering:
+  show_dead_markers: true  # 个体死亡后是否显示 X 标记
+  dead_marker_lifetime: 64 # 死亡标记保留步数

@@ -77,6 +77,7 @@ ENV_DEFAULTS = {
         "snapshot_flush_interval": 8,
         "show_step": True,
     },
+    "rendering": {"show_dead_markers": True, "dead_marker_lifetime": 64},
     "rewards": {
         "survival_reward": 0.0001,
         "food_reward": 1.0,
@@ -104,6 +105,7 @@ ENV_DEFAULTS = {
         "health_decay_min": -1.0,
         "health_decay_mode": "linear",
         "health_decay_coefficient": 1.0,
+        "communication_receive_reward": 0.0,
     },
     "communication": {"radius": 2, "base_strength": 1.0},
     "combat": {"damage": 10.0, "radius": 2.0, "decay": "none"},
@@ -255,13 +257,21 @@ class ProtoLifeEnv:
             ENV_DEFAULTS["logging"]["agent_marker_size"],
         )
         self.show_step = bool(self._get("logging", "show_step", ENV_DEFAULTS["logging"]["show_step"]))
+        self.show_dead_markers = bool(
+            self._get("rendering", "show_dead_markers", ENV_DEFAULTS["rendering"]["show_dead_markers"])
+        )
+        self.dead_marker_lifetime = int(
+            self._get("rendering", "dead_marker_lifetime", ENV_DEFAULTS["rendering"]["dead_marker_lifetime"])
+        )
         if self._get("logging", "realtime_render", ENV_DEFAULTS["logging"]["realtime_render"]):
             self.renderer = GridRenderer(
                 self.height,
                 self.width,
                 agent_marker_size=self.agent_marker_size,
                 show_step=self.show_step,
-        )
+                show_dead_markers=self.show_dead_markers,
+                dead_marker_lifetime=self.dead_marker_lifetime,
+            )
 
         self.base_patch_channels = 6  # terrain/buildable/food/toxin/resource/agents
         self.self_channel_count = 1
@@ -341,6 +351,20 @@ class ProtoLifeEnv:
                 )
                 aggregated = broadcast_messages(messages, positions, comm_radius, comm_strength)
                 self.agent_batch.state["comm"] = aggregated
+            comm_reward = float(
+                self._get(
+                    "rewards",
+                    "communication_receive_reward",
+                    ENV_DEFAULTS["rewards"]["communication_receive_reward"],
+                )
+            )
+            if comm_reward != 0:
+                received_signal = self.agent_batch.state["comm"].abs().sum(dim=-1)
+                rewards = rewards + torch.where(
+                    received_signal > 0,
+                    torch.full_like(rewards, comm_reward),
+                    torch.zeros_like(rewards),
+                )
 
         # 攻击：按距离衰减伤害
         if self._get("features", "use_combat", True):
@@ -997,11 +1021,23 @@ class ProtoLifeEnv:
 class GridRenderer:
     """基于 matplotlib 的简易实时可视化，与 map_editor 交互风格一致。"""
 
-    def __init__(self, height: int, width: int, *, agent_marker_size: float = 10, show_step: bool = True) -> None:
+    def __init__(
+        self,
+        height: int,
+        width: int,
+        *,
+        agent_marker_size: float = 10,
+        show_step: bool = True,
+        show_dead_markers: bool = True,
+        dead_marker_lifetime: int = 64,
+    ) -> None:
         self.height = height
         self.width = width
         self.agent_marker_size = agent_marker_size
         self.show_step = show_step
+        self.show_dead_markers = show_dead_markers
+        self.dead_marker_lifetime = int(dead_marker_lifetime)
+        self._death_steps: torch.Tensor | None = None
         plt.ion()
         self.fig, self.ax = plt.subplots()
         self.img = None
@@ -1026,7 +1062,28 @@ class GridRenderer:
             artist.remove()
         xs = agent_state["x"][0].cpu()
         ys = agent_state["y"][0].cpu()
-        self.ax.scatter(xs, ys, c="red", s=self.agent_marker_size)
+        energies = agent_state["energy"][0].cpu()
+        healths = agent_state["health"][0].cpu()
+        alive_mask = (energies > 0) & (healths > 0)
+        self.ax.scatter(xs[alive_mask], ys[alive_mask], c="red", s=self.agent_marker_size)
+        if self.show_dead_markers and step is not None and self.dead_marker_lifetime > 0:
+            if self._death_steps is None or self._death_steps.numel() != alive_mask.numel():
+                self._death_steps = torch.full_like(alive_mask, -1, dtype=torch.int64)
+            died_now = (~alive_mask) & (self._death_steps < 0)
+            self._death_steps[died_now] = int(step)
+            revived = alive_mask & (self._death_steps >= 0)
+            self._death_steps[revived] = -1
+            show_dead = (~alive_mask) & (self._death_steps >= 0) & (
+                (int(step) - self._death_steps) < self.dead_marker_lifetime
+            )
+            if show_dead.any():
+                self.ax.scatter(
+                    xs[show_dead],
+                    ys[show_dead],
+                    c="red",
+                    s=self.agent_marker_size,
+                    marker="x",
+                )
         if self.show_step and step is not None:
             self.ax.set_title(f"Step: {step}")
         plt.pause(0.001)
