@@ -9,6 +9,7 @@ import yaml
 
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "default.yaml"
+RENDER_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "render.yaml"
 
 
 def _read_yaml(path: Path) -> Dict:
@@ -34,7 +35,21 @@ def _read_yaml(path: Path) -> Dict:
 def load_default_config() -> Dict:
     """加载默认配置，使用缓存避免重复 IO。"""
 
-    return _read_yaml(DEFAULT_CONFIG_PATH)
+    default_config = _read_yaml(DEFAULT_CONFIG_PATH)
+    render_config = _read_yaml(RENDER_CONFIG_PATH)
+    return _deep_merge(default_config, render_config)
+
+
+def _deep_merge(base: Dict, override: Dict) -> Dict:
+    """递归合并配置，override 覆盖 base。"""
+
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
 
 
 def load_config(path: str) -> Tuple[Dict, Dict]:
