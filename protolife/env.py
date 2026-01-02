@@ -69,11 +69,11 @@ ENV_DEFAULTS = {
         "reproduction_energy_threshold": 80,
         "child_energy_fraction": 0.3,
     },
-    "training": {"num_envs": 32, "rollout_steps": 128},
+    "training": {"num_envs": 32, "rollout_steps": 128, "emit_infos": False},
     "logging": {
         "realtime_render": False,
         "agent_marker_size": 10,
-        "snapshot_gpu_stage": False,
+        "snapshot_gpu_stage": True,
         "snapshot_flush_interval": 8,
         "show_step": True,
     },
@@ -563,10 +563,15 @@ class ProtoLifeEnv:
         self._decay_toxins()
 
         dones = (energy <= 0) | (health <= 0)
-        infos: List[Dict] = [
-            {"message": "存活状态" if not dones.view(-1)[i] else "能量或健康耗尽"}
-            for i in range(self.agent_batch.num_envs * self.agent_batch.agents_per_env)
-        ]
+        emit_infos = bool(self._get("training", "emit_infos", ENV_DEFAULTS["training"]["emit_infos"]))
+        if emit_infos:
+            dones_cpu = dones.view(-1).detach().cpu().tolist()
+            infos = [
+                {"message": "存活状态" if not done else "能量或健康耗尽"}
+                for done in dones_cpu
+            ]
+        else:
+            infos = []
 
         observations = self._build_observations()
         if self.renderer:
