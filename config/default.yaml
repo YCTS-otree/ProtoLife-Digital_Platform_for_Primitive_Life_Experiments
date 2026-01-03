@@ -78,6 +78,8 @@ features:
   use_combat: true  # 是否启用战斗
   use_communication: true  # 是否启用通信
   use_terraforming: true  # 是否启用环境改造
+  use_death: true  # 是否启用死亡机制（能量/健康耗尽）
+  use_health: true  # 是否启用健康机制
 
 # 日志与可视化设置
 logging:
@@ -128,7 +130,8 @@ rewards:
   vision_decay_coefficient: 1.0   # 距离衰减系数（随距离增大奖励降低）
   energy_fit_threshold: 50.0      # 能量奖励的拐点能量值
   energy_reward_at_fit: 0.05      # 能量处于拐点时的奖励
-  energy_reward_at_extreme: -0.05  # 能量达到极端（0 或最大）时的奖励
+  energy_reward_at_extreme: -0.05  # 能量为 0 时的奖励
+  energy_reward_at_max: 0.0        # 能量达到最大值时的奖励
   energy_reward_mode: linear      # 能量奖励曲线模式：linear/log/invlog
   energy_reward_coefficient: 1.0  # 能量奖励曲线系数
   health_reward_at_max: 0.05      # 健康达到最大值时的奖励
