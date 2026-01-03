@@ -78,6 +78,7 @@ ENV_DEFAULTS = {
         "show_step": True,
     },
     "rendering": {"show_dead_markers": True, "dead_marker_lifetime": 64},
+    "features": {"use_death": True, "use_health": True},
     "rewards": {
         "survival_reward": 0.0001,
         "food_reward": 1.0,
@@ -94,6 +95,7 @@ ENV_DEFAULTS = {
         "energy_fit_threshold": 50.0,
         "energy_reward_at_fit": 0.05,
         "energy_reward_at_extreme": -0.05,
+        "energy_reward_at_max": 0.0,
         "energy_reward_mode": "linear",
         "energy_reward_coefficient": 1.0,
         "health_reward_at_max": 0.05,
@@ -175,6 +177,13 @@ class ProtoLifeEnv:
                 "rewards",
                 "energy_reward_at_extreme",
                 ENV_DEFAULTS["rewards"]["energy_reward_at_extreme"],
+            )
+        )
+        self.energy_reward_at_max = float(
+            self._get(
+                "rewards",
+                "energy_reward_at_max",
+                ENV_DEFAULTS["rewards"]["energy_reward_at_max"],
             )
         )
         self.energy_reward_mode = str(
@@ -263,6 +272,8 @@ class ProtoLifeEnv:
         self.dead_marker_lifetime = int(
             self._get("rendering", "dead_marker_lifetime", ENV_DEFAULTS["rendering"]["dead_marker_lifetime"])
         )
+        self.use_death = bool(self._get("features", "use_death", ENV_DEFAULTS["features"]["use_death"]))
+        self.use_health = bool(self._get("features", "use_health", ENV_DEFAULTS["features"]["use_health"]))
         if self._get("logging", "realtime_render", ENV_DEFAULTS["logging"]["realtime_render"]):
             self.renderer = GridRenderer(
                 self.height,
@@ -367,7 +378,7 @@ class ProtoLifeEnv:
                 )
 
         # 攻击：按距离衰减伤害
-        if self._get("features", "use_combat", True):
+        if self._get("features", "use_combat", True) and self.use_health:
             attack_mask = actions_2d == 6
             if attack_mask.any():
                 attack_radius = float(
@@ -420,8 +431,10 @@ class ProtoLifeEnv:
             child_fraction = self._get(
                 "agents", "child_energy_fraction", ENV_DEFAULTS["agents"]["child_energy_fraction"]
             )
-            health_cost = self._get(
-                "reproduction", "health_cost", ENV_DEFAULTS["reproduction"]["health_cost"]
+            health_cost = (
+                self._get("reproduction", "health_cost", ENV_DEFAULTS["reproduction"]["health_cost"])
+                if self.use_health
+                else 0.0
             )
             eligible = reproduction_mask & can_reproduce(energy, threshold)
 
@@ -429,9 +442,13 @@ class ProtoLifeEnv:
                 parents = torch.nonzero(eligible[env_idx], as_tuple=False).view(-1)
                 if parents.numel() == 0:
                     continue
-                dead_slots = torch.nonzero(
-                    (energy[env_idx] <= 0) | (health[env_idx] <= 0), as_tuple=False
-                ).view(-1)
+                if self.use_death:
+                    dead_mask = energy[env_idx] <= 0
+                    if self.use_health:
+                        dead_mask = dead_mask | (health[env_idx] <= 0)
+                    dead_slots = torch.nonzero(dead_mask, as_tuple=False).view(-1)
+                else:
+                    dead_slots = torch.tensor([], dtype=torch.int64, device=self.device)
                 if dead_slots.numel() == 0:
                     continue
 
@@ -444,10 +461,11 @@ class ProtoLifeEnv:
                     transfer_energy = energy[env_idx, parent_idx] * child_fraction
                     energy[env_idx, parent_idx] -= transfer_energy
                     energy[env_idx, child_idx] = transfer_energy
-                    health[env_idx, parent_idx] -= health_cost
-                    health[env_idx, child_idx] = self._get(
-                        "agents", "base_health", ENV_DEFAULTS["agents"]["base_health"]
-                    )
+                    if self.use_health:
+                        health[env_idx, parent_idx] -= health_cost
+                        health[env_idx, child_idx] = self._get(
+                            "agents", "base_health", ENV_DEFAULTS["agents"]["base_health"]
+                        )
                     x[env_idx, child_idx] = x[env_idx, parent_idx]
                     y[env_idx, child_idx] = y[env_idx, parent_idx]
                     self.agent_batch.state["age"][env_idx, child_idx] = 0
@@ -536,22 +554,24 @@ class ProtoLifeEnv:
             rewards + self._get("rewards", "toxin_eat_penalty", ENV_DEFAULTS["rewards"]["toxin_eat_penalty"]),
             rewards,
         )
-        health = torch.where(
-            toxin_mask,
-            health + self._get("rewards", "toxin_health", ENV_DEFAULTS["rewards"]["toxin_health"]),
-            health,
-        )
-
-        health = self._update_health_from_energy(health, energy)
+        if self.use_health:
+            health = torch.where(
+                toxin_mask,
+                health + self._get("rewards", "toxin_health", ENV_DEFAULTS["rewards"]["toxin_health"]),
+                health,
+            )
+            health = self._update_health_from_energy(health, energy)
+            health = torch.clamp(health, min=0.0, max=self.health_max)
 
         energy = torch.clamp(energy, min=0.0, max=self.energy_max)
-        health = torch.clamp(health, min=0.0, max=self.health_max)
 
         rewards = rewards + self._compute_energy_reward(energy)
-        rewards = rewards + self._compute_health_reward(health)
+        if self.use_health:
+            rewards = rewards + self._compute_health_reward(health)
 
         self.agent_batch.state["energy"] = energy
-        self.agent_batch.state["health"] = health
+        if self.use_health:
+            self.agent_batch.state["health"] = health
 
         # 生存奖励，鼓励活着
         rewards += self._get("rewards", "survival_reward", ENV_DEFAULTS["rewards"]["survival_reward"])
@@ -562,7 +582,13 @@ class ProtoLifeEnv:
         # 毒素衰减
         self._decay_toxins()
 
-        dones = (energy <= 0) | (health <= 0)
+        if self.use_death:
+            if self.use_health:
+                dones = (energy <= 0) | (health <= 0)
+            else:
+                dones = energy <= 0
+        else:
+            dones = torch.zeros_like(energy, dtype=torch.bool)
         emit_infos = bool(self._get("training", "emit_infos", ENV_DEFAULTS["training"]["emit_infos"]))
         if emit_infos:
             dones_cpu = dones.view(-1).detach().cpu().tolist()
@@ -575,7 +601,13 @@ class ProtoLifeEnv:
 
         observations = self._build_observations()
         if self.renderer:
-            self.renderer.render(self.map_state[0], self.agent_batch.state, step=self.step_count)
+            self.renderer.render(
+                self.map_state[0],
+                self.agent_batch.state,
+                step=self.step_count,
+                use_health=self.use_health,
+                use_death=self.use_death,
+            )
 
         return EnvStepResult(observations=observations, rewards=rewards.view(-1), dones=dones.view(-1), infos=infos)
 
@@ -613,7 +645,7 @@ class ProtoLifeEnv:
             rewards_upper = self._interpolate_reward(
                 normalized_upper,
                 self.energy_reward_at_fit,
-                self.energy_reward_extreme,
+                self.energy_reward_at_max,
                 self.energy_reward_mode,
                 self.energy_reward_coefficient,
             )
@@ -1057,7 +1089,15 @@ class GridRenderer:
         display = torch.where((grid & BIT_RESOURCE) > 0, torch.tensor(0.6), display)
         return display
 
-    def render(self, grid: torch.Tensor, agent_state: Dict[str, torch.Tensor], *, step: int | None = None) -> None:
+    def render(
+        self,
+        grid: torch.Tensor,
+        agent_state: Dict[str, torch.Tensor],
+        *,
+        step: int | None = None,
+        use_health: bool = True,
+        use_death: bool = True,
+    ) -> None:
         display = self._to_display(grid.cpu())
         if self.img is None:
             self.img = self.ax.imshow(display, cmap="viridis", vmin=0, vmax=1)
@@ -1069,9 +1109,14 @@ class GridRenderer:
         ys = agent_state["y"][0].cpu()
         energies = agent_state["energy"][0].cpu()
         healths = agent_state["health"][0].cpu()
-        alive_mask = (energies > 0) & (healths > 0)
+        if use_death:
+            alive_mask = energies > 0
+            if use_health:
+                alive_mask = alive_mask & (healths > 0)
+        else:
+            alive_mask = torch.ones_like(energies, dtype=torch.bool)
         self.ax.scatter(xs[alive_mask], ys[alive_mask], c="red", s=self.agent_marker_size)
-        if self.show_dead_markers and step is not None and self.dead_marker_lifetime > 0:
+        if self.show_dead_markers and step is not None and self.dead_marker_lifetime > 0 and use_death:
             if self._death_steps is None or self._death_steps.numel() != alive_mask.numel():
                 self._death_steps = torch.full_like(alive_mask, -1, dtype=torch.int64)
             died_now = (~alive_mask) & (self._death_steps < 0)
