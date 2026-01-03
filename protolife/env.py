@@ -69,7 +69,7 @@ ENV_DEFAULTS = {
         "reproduction_energy_threshold": 80,
         "child_energy_fraction": 0.3,
     },
-    "training": {"num_envs": 32, "rollout_steps": 128, "emit_infos": False},
+    "training": {"num_envs": 32, "rollout_steps": 128, "emit_infos": False, "info_interval": 0},
     "logging": {
         "realtime_render": False,
         "agent_marker_size": 10,
@@ -353,7 +353,7 @@ class ProtoLifeEnv:
                 )
             )
             comm_mask = actions_2d == 7
-            if comm_mask.any() and comm_radius > 0:
+            if comm_radius > 0:
                 positions = torch.stack([x, y], dim=-1)
                 messages = torch.where(
                     comm_mask.unsqueeze(-1),
@@ -380,16 +380,16 @@ class ProtoLifeEnv:
         # 攻击：按距离衰减伤害
         if self._get("features", "use_combat", True) and self.use_health:
             attack_mask = actions_2d == 6
-            if attack_mask.any():
-                attack_radius = float(
-                    self._get("combat", "radius", ENV_DEFAULTS["combat"]["radius"])
-                )
-                attack_damage = float(
-                    self._get("combat", "damage", ENV_DEFAULTS["combat"]["damage"])
-                )
-                decay_mode = str(
-                    self._get("combat", "decay", ENV_DEFAULTS["combat"]["decay"])
-                ).lower()
+            attack_radius = float(
+                self._get("combat", "radius", ENV_DEFAULTS["combat"]["radius"])
+            )
+            attack_damage = float(
+                self._get("combat", "damage", ENV_DEFAULTS["combat"]["damage"])
+            )
+            decay_mode = str(
+                self._get("combat", "decay", ENV_DEFAULTS["combat"]["decay"])
+            ).lower()
+            if attack_radius > 0 and attack_damage != 0:
                 positions = torch.stack([x, y], dim=-1).float()
                 distances = torch.cdist(positions, positions, p=2)
                 valid = (distances <= attack_radius) & (distances > 0)
@@ -403,7 +403,9 @@ class ProtoLifeEnv:
                         1.0 - distances / max(attack_radius, 1e-6), min=0.0
                     )
                 else:
-                    damage_scale = torch.where(valid, torch.full_like(distances, attack_damage), torch.zeros_like(distances))
+                    damage_scale = torch.where(
+                        valid, torch.full_like(distances, attack_damage), torch.zeros_like(distances)
+                    )
 
                 damage_scale = torch.where(valid, damage_scale, torch.zeros_like(damage_scale))
                 attacker_mask = attack_mask.unsqueeze(1).expand_as(damage_scale)
@@ -437,44 +439,58 @@ class ProtoLifeEnv:
                 else 0.0
             )
             eligible = reproduction_mask & can_reproduce(energy, threshold)
+            if self.use_death:
+                dead_mask = energy <= 0
+                if self.use_health:
+                    dead_mask = dead_mask | (health <= 0)
+            else:
+                dead_mask = torch.zeros_like(eligible, dtype=torch.bool)
 
-            for env_idx in range(self.agent_batch.num_envs):
-                parents = torch.nonzero(eligible[env_idx], as_tuple=False).view(-1)
-                if parents.numel() == 0:
-                    continue
-                if self.use_death:
-                    dead_mask = energy[env_idx] <= 0
-                    if self.use_health:
-                        dead_mask = dead_mask | (health[env_idx] <= 0)
-                    dead_slots = torch.nonzero(dead_mask, as_tuple=False).view(-1)
-                else:
-                    dead_slots = torch.tensor([], dtype=torch.int64, device=self.device)
-                if dead_slots.numel() == 0:
-                    continue
+            parent_rank = torch.where(
+                eligible,
+                torch.cumsum(eligible, dim=1).to(torch.int64) - 1,
+                torch.full_like(eligible, -1, dtype=torch.int64),
+            )
+            dead_rank = torch.where(
+                dead_mask,
+                torch.cumsum(dead_mask, dim=1).to(torch.int64) - 1,
+                torch.full_like(dead_mask, -1, dtype=torch.int64),
+            )
+            dead_count = dead_mask.sum(dim=1)
+            valid_parent = (parent_rank >= 0) & (parent_rank < dead_count.unsqueeze(1))
 
-                for parent_idx in parents:
-                    if dead_slots.numel() == 0:
-                        break
-                    child_idx = dead_slots[0]
-                    dead_slots = dead_slots[1:]
+            dead_indices_by_rank = torch.full(
+                (self.agent_batch.num_envs, self.agent_batch.agents_per_env),
+                -1,
+                dtype=torch.int64,
+                device=self.device,
+            )
+            dead_envs, dead_pos = dead_mask.nonzero(as_tuple=True)
+            dead_slots = dead_rank[dead_envs, dead_pos]
+            dead_indices_by_rank.index_put_((dead_envs, dead_slots), dead_pos, accumulate=False)
 
-                    transfer_energy = energy[env_idx, parent_idx] * child_fraction
-                    energy[env_idx, parent_idx] -= transfer_energy
-                    energy[env_idx, child_idx] = transfer_energy
-                    if self.use_health:
-                        health[env_idx, parent_idx] -= health_cost
-                        health[env_idx, child_idx] = self._get(
-                            "agents", "base_health", ENV_DEFAULTS["agents"]["base_health"]
-                        )
-                    x[env_idx, child_idx] = x[env_idx, parent_idx]
-                    y[env_idx, child_idx] = y[env_idx, parent_idx]
-                    self.agent_batch.state["age"][env_idx, child_idx] = 0
-                    self.agent_batch.state["generation"][env_idx, child_idx] = (
-                        self.agent_batch.state["generation"][env_idx, parent_idx] + 1
-                    )
-                    self.agent_batch.state["genome_id"][env_idx, child_idx] = self.agent_batch.state[
-                        "genome_id"
-                    ][env_idx, parent_idx]
+            gather_rank = parent_rank.clamp(min=0)
+            child_candidates = dead_indices_by_rank.gather(1, gather_rank)
+            parent_envs, parent_pos = valid_parent.nonzero(as_tuple=True)
+            child_pos = child_candidates[parent_envs, parent_pos]
+
+            transfer_energy = energy[parent_envs, parent_pos] * child_fraction
+            energy[parent_envs, parent_pos] -= transfer_energy
+            energy[parent_envs, child_pos] = transfer_energy
+            if self.use_health:
+                health[parent_envs, parent_pos] -= health_cost
+                health[parent_envs, child_pos] = self._get(
+                    "agents", "base_health", ENV_DEFAULTS["agents"]["base_health"]
+                )
+            x[parent_envs, child_pos] = x[parent_envs, parent_pos]
+            y[parent_envs, child_pos] = y[parent_envs, parent_pos]
+            self.agent_batch.state["age"][parent_envs, child_pos] = 0
+            self.agent_batch.state["generation"][parent_envs, child_pos] = (
+                self.agent_batch.state["generation"][parent_envs, parent_pos] + 1
+            )
+            self.agent_batch.state["genome_id"][parent_envs, child_pos] = self.agent_batch.state[
+                "genome_id"
+            ][parent_envs, parent_pos]
 
         # 交互：食物/毒素
         env_ids = torch.arange(self.agent_batch.num_envs, device=self.device).unsqueeze(1).expand_as(actions_2d)
@@ -590,7 +606,8 @@ class ProtoLifeEnv:
         else:
             dones = torch.zeros_like(energy, dtype=torch.bool)
         emit_infos = bool(self._get("training", "emit_infos", ENV_DEFAULTS["training"]["emit_infos"]))
-        if emit_infos:
+        info_interval = int(self._get("training", "info_interval", ENV_DEFAULTS["training"]["info_interval"]))
+        if emit_infos and info_interval > 0 and self.step_count % info_interval == 0:
             dones_cpu = dones.view(-1).detach().cpu().tolist()
             infos = [
                 {"message": "存活状态" if not done else "能量或健康耗尽"}
@@ -636,9 +653,9 @@ class ProtoLifeEnv:
         upper_mask = energy >= self.energy_reward_fit
         lower_mask = energy < self.energy_reward_fit
 
-        if upper_mask.any() and self.energy_max > self.energy_reward_fit:
+        if self.energy_max > self.energy_reward_fit:
             normalized_upper = torch.clamp(
-                (energy[upper_mask] - self.energy_reward_fit) / max(self.energy_max - self.energy_reward_fit, 1e-6),
+                (energy - self.energy_reward_fit) / max(self.energy_max - self.energy_reward_fit, 1e-6),
                 0.0,
                 1.0,
             )
@@ -649,11 +666,11 @@ class ProtoLifeEnv:
                 self.energy_reward_mode,
                 self.energy_reward_coefficient,
             )
-            rewards = rewards.masked_scatter(upper_mask, rewards_upper)
+            rewards = torch.where(upper_mask, rewards_upper, rewards)
 
-        if lower_mask.any() and self.energy_reward_fit > 0:
+        if self.energy_reward_fit > 0:
             normalized_lower = torch.clamp(
-                (self.energy_reward_fit - energy[lower_mask]) / max(self.energy_reward_fit, 1e-6),
+                (self.energy_reward_fit - energy) / max(self.energy_reward_fit, 1e-6),
                 0.0,
                 1.0,
             )
@@ -664,7 +681,7 @@ class ProtoLifeEnv:
                 self.energy_reward_mode,
                 self.energy_reward_coefficient,
             )
-            rewards = rewards.masked_scatter(lower_mask, rewards_lower)
+            rewards = torch.where(lower_mask, rewards_lower, rewards)
 
         return rewards
 
@@ -686,21 +703,19 @@ class ProtoLifeEnv:
             return health
 
         recovery_mask = energy > self.health_recovery_energy_threshold
-        if recovery_mask.any() and self.health_recovery_per_step != 0:
+        if self.health_recovery_per_step != 0:
             health = torch.where(recovery_mask, health + self.health_recovery_per_step, health)
 
         decay_mask = energy < self.health_recovery_energy_threshold
-        if decay_mask.any() and self.health_decay_min != 0:
+        if self.health_decay_min != 0:
             normalized = torch.clamp(
-                (self.health_recovery_energy_threshold - energy[decay_mask])
+                (self.health_recovery_energy_threshold - energy)
                 / max(self.health_recovery_energy_threshold, 1e-6),
                 0.0,
                 1.0,
             )
             decay_scale = self._apply_curve(normalized, self.health_decay_mode, self.health_decay_coefficient)
-            scaled_decay = torch.zeros_like(health)
-            scaled_decay[decay_mask] = decay_scale * self.health_decay_min
-            health = health + scaled_decay
+            health = torch.where(decay_mask, health + decay_scale * self.health_decay_min, health)
 
         return health
 
@@ -971,8 +986,7 @@ class ProtoLifeEnv:
         """确保当前地图上的毒素年龄归零，用于重置或从地图加载。"""
 
         toxin_mask = (self.map_state & BIT_TOXIN).bool()
-        if toxin_mask.any():
-            self.toxin_age = torch.where(toxin_mask, torch.zeros_like(self.toxin_age), self.toxin_age)
+        self.toxin_age = torch.where(toxin_mask, torch.zeros_like(self.toxin_age), self.toxin_age)
 
     def _maybe_respawn_resources(self) -> None:
         """根据配置周期性刷新食物/毒素。"""
@@ -993,9 +1007,8 @@ class ProtoLifeEnv:
         toxin_mask = (self.map_state & BIT_TOXIN).bool()
         self.toxin_age = torch.where(toxin_mask, self.toxin_age + 1, torch.zeros_like(self.toxin_age))
         expired = toxin_mask & (self.toxin_age >= self.toxin_lifetime)
-        if expired.any():
-            self.map_state = torch.where(expired, self.map_state & (~BIT_TOXIN), self.map_state)
-            self.toxin_age = torch.where(expired, torch.zeros_like(self.toxin_age), self.toxin_age)
+        self.map_state = torch.where(expired, self.map_state & (~BIT_TOXIN), self.map_state)
+        self.toxin_age = torch.where(expired, torch.zeros_like(self.toxin_age), self.toxin_age)
 
     def _extract_local_observation(self) -> torch.Tensor:
         """裁剪每个体周围 r 范围内的网格并转为 multi-hot 通道。"""
