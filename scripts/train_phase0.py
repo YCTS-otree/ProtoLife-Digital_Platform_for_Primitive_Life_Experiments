@@ -31,6 +31,9 @@ TRAIN_DEFAULTS = {
         "action_noise": {"gaussian_std": 0.0, "epsilon": 0.0},
         "print_actions": False,
         "print_interval": 128,
+        "log_interval": 200,
+        "debug_profile": False,
+        "profile_steps": 200,
     },
     "logging": {"save_dir": "runs/default", "snapshot_interval": 50},
 }
@@ -81,6 +84,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume-from", type=str, default=None, help="从完整 checkpoint 继续推演")
     parser.add_argument("--load-model", type=str, default=None, help="仅加载模型权重")
     parser.add_argument("--print-interval", type=int, default=None, help="训练日志打印间隔")
+    parser.add_argument("--log-interval", type=int, default=None, help="同步到 CPU 的日志间隔")
     return parser.parse_args()
 
 
@@ -216,6 +220,11 @@ def main() -> None:
     print_interval = args.print_interval or get_cfg(
         config, default_config, "training", "print_interval", TRAIN_DEFAULTS["training"]["print_interval"]
     )
+    log_interval = args.log_interval or get_cfg(
+        config, default_config, "training", "log_interval", print_interval
+    )
+    debug_profile = bool(get_cfg(config, default_config, "training", "debug_profile", False))
+    profile_steps = int(get_cfg(config, default_config, "training", "profile_steps", 200))
 
     action_noise_cfg = (
         config.get("training", {}).get("action_noise")
@@ -255,6 +264,21 @@ def main() -> None:
     rollout_steps = get_cfg(config, default_config, "training", "rollout_steps", 128)
     last_print_time = time.perf_counter()
     last_print_step = total_steps
+    profiler = None
+    if debug_profile and profile_steps > 0:
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if torch.cuda.is_available():
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+        profile_steps = min(profile_steps, rollout_steps)
+        profiler = torch.profiler.profile(
+            activities=activities,
+            schedule=torch.profiler.schedule(wait=0, warmup=0, active=profile_steps, repeat=1),
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=False,
+        )
+        profiler.__enter__()
+
     for step in range(rollout_steps):
         if getattr(policy, "use_cnn", False):
             patches = obs["patch"]
@@ -287,7 +311,7 @@ def main() -> None:
             greedy_mask = torch.rand(actions.shape, device=actions.device, dtype=torch.float32) < epsilon_greedy
             actions = torch.where(greedy_mask, random_actions, actions)
 
-        if print_actions:
+        if print_actions and log_interval > 0 and total_steps % log_interval == 0:
             action_ids = actions.cpu().tolist()
             names = [action_space.get(int(a), str(int(a))) for a in action_ids]
             print(f"[step={total_steps}] actions: {action_ids} -> {names}")
@@ -310,7 +334,7 @@ def main() -> None:
         obs = step_result.observations
         total_steps += 1
 
-        if print_interval > 0 and total_steps % print_interval == 0:
+        if log_interval > 0 and total_steps % log_interval == 0:
             now = time.perf_counter()
             step_delta = total_steps - last_print_step
             time_delta = now - last_print_time
@@ -327,8 +351,10 @@ def main() -> None:
                 step_rate_text = "n/a"
                 model_speed_text = "n/a"
 
+            reward_mean = rewards.mean().item()
             print(
-                f"steps:{total_steps}  rewards:{rewards}  step_rate:{step_rate_text}  model_speed:{model_speed_text}"
+                f"steps:{total_steps}  reward_mean:{reward_mean:.4f}  step_rate:{step_rate_text}  "
+                f"model_speed:{model_speed_text}"
             )
             last_print_time = now
             last_print_step = total_steps
@@ -348,6 +374,15 @@ def main() -> None:
                 meta={"step": total_steps},
             )
             print(f"已保存 checkpoint 至 {checkpoint_dir}, step={total_steps}")
+
+        if profiler is not None:
+            profiler.step()
+
+    if profiler is not None:
+        profiler.__exit__(None, None, None)
+        sort_cuda = "cuda_time_total" if torch.cuda.is_available() else "cpu_time_total"
+        print(profiler.key_averages().table(sort_by=sort_cuda, row_limit=20))
+        print(profiler.key_averages().table(sort_by="cpu_time_total", row_limit=20))
 
     if logger:
         logger.flush()
