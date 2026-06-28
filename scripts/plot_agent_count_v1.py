@@ -6,15 +6,15 @@
 
 适合续训/断点恢复场景：
 - 可以一次传入多个 log；
-- 会按实际 step 顺序合并；
-- 如果不同 log 中出现重复 step，后面的续训段会覆盖前面的同 step 数据；
+- 会按 step 合并，并按文件创建时间决定覆盖优先级；
+- 如果不同 log 中出现重复 step，创建时间较晚的文件覆盖较早文件；
 - 不保存图片，只用 matplotlib 弹窗显示。
 
 用法：
-    python plot_agent_count_multi.py run_1_agents.jsonl run_2_agents.jsonl
+    python plot_agent_count_v1.py run_1_agents.jsonl run_2_agents.jsonl
 
 如果不传参：
-    python plot_agent_count_multi.py
+    python plot_agent_count_v1.py
 然后每行输入一个 log 文件路径，直接回车结束输入并开始绘图。
 
 路径可以带普通引号、中文引号，也可以包含空格。
@@ -52,6 +52,7 @@ class LogData:
     steps: list[int]
     counts: list[int]
     meta: dict[str, Any]
+    created_at_ns: int = 0
     input_order: int = 0
 
     @property
@@ -225,33 +226,38 @@ def read_log(log_path: Path, input_order: int = 0, quiet: bool = False) -> LogDa
     steps = [x[0] for x in data]
     counts = [x[1] for x in data]
 
-    return LogData(path=log_path, steps=steps, counts=counts, meta=meta, input_order=input_order)
+    return LogData(
+        path=log_path,
+        steps=steps,
+        counts=counts,
+        meta=meta,
+        created_at_ns=file_creation_time_ns(log_path),
+        input_order=input_order,
+    )
+
+
+def file_creation_time_ns(path: Path) -> int:
+    """返回文件创建时间；不支持 birth time 的系统回退到 st_ctime。"""
+
+    stat = path.stat()
+    birthtime = getattr(stat, "st_birthtime", None)
+    if birthtime is not None:
+        return int(birthtime * 1_000_000_000)
+    return stat.st_ctime_ns
 
 
 def chronological_key(log: LogData) -> tuple[int, int]:
-    """用于把多个续训 log 排成时间顺序。"""
-    candidates: list[int] = []
+    """旧文件先合并、新文件后合并，使重叠 step 采用较晚创建的文件。"""
 
-    for key in ("start_step", "resumed_from_step"):
-        value = log.meta.get(key)
-        if isinstance(value, int):
-            candidates.append(value)
-
-    if log.first_step is not None:
-        candidates.append(log.first_step)
-
-    if candidates:
-        return min(candidates), log.input_order
-
-    return 10**18, log.input_order
+    return log.created_at_ns, log.input_order
 
 
 def combine_logs(logs: list[LogData]) -> tuple[list[int], list[int], list[LogData]]:
     """
     合并多个 log。
 
-    返回合并后的 steps/counts，以及按时间排序后的 log 列表。
-    如果存在重复 step，后出现的 log 覆盖前面的同 step 数据。
+    返回合并后的 steps/counts，以及按创建时间排序后的 log 列表。
+    如果存在重复 step，创建时间较晚的 log 覆盖较早文件的数据。
     """
     ordered_logs = sorted(logs, key=chronological_key)
 

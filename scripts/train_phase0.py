@@ -30,6 +30,8 @@ TRAIN_DEFAULTS = {
         "rollout_steps": 128,
         "save_interval": 100,
         "entropy_coef": 0.01,
+        "learning_rate": 1e-4,
+        "max_grad_norm": 1.0,
         "action_noise": {"gaussian_std": 0.0, "epsilon": 0.0},
         "print_actions": False,
         "print_interval": 128,
@@ -281,12 +283,20 @@ def main() -> None:
 
     env = ProtoLifeEnv(config, default_config)
     policy = build_policy(config, default_config, obs_dim=env.observation_dim, patch_shape=env.patch_shape).to(env.device)
+    learning_rate = float(
+        get_cfg(config, default_config, "training", "learning_rate", TRAIN_DEFAULTS["training"]["learning_rate"])
+    )
+    max_grad_norm = float(
+        get_cfg(config, default_config, "training", "max_grad_norm", TRAIN_DEFAULTS["training"]["max_grad_norm"])
+    )
+    if learning_rate <= 0:
+        raise ValueError("training.learning_rate 必须大于 0")
     try:
         optimizer = torch.optim.Adam(
-            policy.parameters(), lr=1e-3, fused=env.device.type == "cuda"
+            policy.parameters(), lr=learning_rate, fused=env.device.type == "cuda"
         )
     except TypeError:
-        optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
+        optimizer = torch.optim.Adam(policy.parameters(), lr=learning_rate)
     if getattr(policy, "cnn_independent", False):
         print(f"已启用 {policy.brain_count} 个完全独立的 CNN 个体大脑")
 
@@ -358,6 +368,9 @@ def main() -> None:
         skipped = _load_state_dict_lenient(policy, policy_state)
         if optim_state and not skipped:
             optimizer.load_state_dict(optim_state)
+            # optimizer checkpoint 会保存旧学习率；续训时以当前 YAML 配置为准。
+            for parameter_group in optimizer.param_groups:
+                parameter_group["lr"] = learning_rate
         start_step = int(meta.get("step", 0))
         env.step_count = start_step
         obs = env._build_observations()
@@ -459,6 +472,8 @@ def main() -> None:
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        if max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
         optimizer.step()
 
         if step_result.reproduction_events and hasattr(policy, "inherit_policy_head"):

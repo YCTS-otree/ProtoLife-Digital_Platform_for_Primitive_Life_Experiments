@@ -37,6 +37,8 @@ protolife/
 scripts/
   train_phase0.py
   map_editor.py               # 命令行地图编辑器
+  plot_agent_count_v1.py      # 合并 JSONL 并绘制个体数量曲线
+  watch_agent_count_live.py   # 实时监控 JSONL 个体数量变化
 maps/
   default_map.hex             # 简单示例地图（8×8 全空）
 ```
@@ -80,10 +82,13 @@ maps/
      - `rnn_hidden_dim` / `rnn_type`：启用 GRU（默认）或 LSTM 作为短期记忆，隐状态会作为 Agent 侧的 `memory` 保存到 checkpoint，旧存档缺失该字段时会自动补零。
      - `hidden`：当 `use_cnn` 关闭时回退的 MLP 隐藏层规模。
    - `training`：并行环境数、回合步数、保存间隔等训练相关参数（示例：`num_envs: 8`, `save_interval: 100`, `checkpoint_dir: checkpoints/phase0`）。
-     可用 `entropy_coef` 调整策略熵正则（默认提供非零值防止动作过早塌缩），`action_noise` 下的 `gaussian_std` 与 `epsilon` 分别控制 logits 高斯噪声和 epsilon-greedy 随机探索。
+     可用 `learning_rate` 调整 Adam 学习率（默认 `0.0001`），`max_grad_norm` 控制梯度范数裁剪（默认 `1.0`，设为 `0` 关闭）。`entropy_coef` 调整策略熵正则，`action_noise` 下的 `gaussian_std` 与 `epsilon` 分别控制 logits 高斯噪声和 epsilon-greedy 随机探索。
      若需要调试模型的动作采样，可开启 `print_actions: true` 查看每步动作编号与含义。
    - `action_rewards`：行为基础奖励，可为正/负（示例：`MOVE: 0.01`, `ATTACK: -0.01`）。
    - `rewards`：生存/进食奖励与食物感知奖励开关。
+     - `food_reward_min` / `food_reward_max`：成功进食奖励的下限/上限；按进食前能量计算，能量越低奖励越高。
+     - `food_reward_mode`：`linear` 为线性变化；`log` 会让奖励在能量接近上限时更集中地跌向最低值。
+     - `food_reward_coefficient`：`log` 曲线强度，值越大，末端跌落越集中。旧模型若只有 `food_reward`，仍按固定奖励兼容。
      - `enable_proximity_reward`：是否根据感知范围内最近食物给予距离衰减奖励（默认开启）。
      - `see_food_reward` / `stand_on_food_reward`：看到食物/踩在食物格时的基础奖励（默认 `0.005` / `0.02`）。
      - `vision_decay_mode` 与 `vision_decay_coefficient`：控制距离衰减；`linear` 模式在半径处衰减到 `max(0, 1 - coeff)`，`log` 模式使用 `1 / (1 + coeff * log(1+d))` 更平滑。
@@ -99,6 +104,7 @@ maps/
 - 默认 `model.use_cnn: true`，环境会为每个体在 GPU 上一次性裁剪局部网格 patch，shape 为 `(num_envs, agents_per_env, C, H, W)`，其中 `C` 包含墙/可建造区/食物/毒素/资源/其他个体以及中心“自身”指示。
 - 策略网络改为 `CNNRecurrentPolicy`：卷积编码 -> GRU/LSTM 短期记忆 -> 动作 logits 与价值输出，兼容多环境、多智能体同时运行。
 - Agent 侧新增 `memory`（以及 LSTM 时的 `memory_cell`）字段，reset 时自动清零，checkpoint 会连同地图与优化器一起保存/恢复；旧存档缺少该字段时自动补零以避免维度错误。
+- 当前训练器会保留隐状态用于后续决策，但每一步更新后都会从计算图分离，因此目前是单步信用分配；增大 `rnn_hidden_dim` 只增加记忆容量，不能替代多步回报、GAE 或 TBPTT。
 - 若需要回退到旧的 MLP，占位策略，可在 YAML 中将 `model.use_cnn` 设为 `false`，其余训练入口与参数保持不变。
 
 4. **常见问题排查**
@@ -156,5 +162,17 @@ maps/
          ```
 
          或在代码中调用 `protolife.replay.playback`。
+
+8. **个体数量曲线与实时监控**
+   - 静态合并绘图：
+     ```bash
+     python scripts/plot_agent_count_v1.py model/test_CNN/log/旧日志_agents.jsonl model/test_CNN/log/新日志_agents.jsonl
+     ```
+     可以传入任意数量的 JSONL；重叠 step 采用文件创建时间较晚的数据。省略参数时，脚本会逐行询问文件路径，空行结束输入并绘图。
+   - 实时监控正在写入的日志：
+     ```bash
+     python scripts/watch_agent_count_live.py model/test_CNN/log/旧日志_agents.jsonl model/test_CNN/log/当前日志_agents.jsonl
+     ```
+     文件变化后会自动刷新。鼠标左键拖动查看历史，滚轮缩放 X 轴，按 `f` 或 `r` 恢复跟随最新 step；省略参数同样进入逐行输入模式。
 
 本 README 为概览，详细设计思路请参考源码中的中文注释，后续可在此基础上逐步补全能量代谢、战斗、通信等真实逻辑。

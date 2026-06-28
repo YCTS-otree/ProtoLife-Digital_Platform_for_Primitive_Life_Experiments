@@ -70,6 +70,8 @@ training:
   gae_lambda: 0.95  # GAE 参数
   ppo_clip: 0.2  # PPO clip 系数（预留）
   entropy_coef: 0.01  # 策略熵权重，防止动作过早塌缩，设置为 0 可关闭
+  learning_rate: 0.0001  # Adam 学习率；在线单步更新建议从 1e-4 起步
+  max_grad_norm: 1.0  # 梯度范数裁剪；设为 0 可关闭
   action_noise:  # 行动时额外注入的噪声配置
     gaussian_std: 0.001  # 对 logits 添加的高斯噪声标准差
     epsilon: 0.001  # 以 epsilon 概率使用均匀随机动作（epsilon-greedy）
@@ -125,7 +127,10 @@ action_energy_costs:
 # 额外奖励/惩罚系数
 rewards:
   survival_reward: 0.001  # 每步活着获得的奖励
-  food_reward: 0.5        # 成功吃到食物奖励
+  food_reward_min: 0.1    # 满能量附近成功进食的最低奖励
+  food_reward_max: 0.5    # 低能量时成功进食的最高奖励
+  food_reward_mode: log   # 奖励曲线：linear 或 log
+  food_reward_coefficient: 4.0  # log 曲线系数；越大越集中在接近满能量时快速跌落
   food_energy: 10.0       # 吃到食物补充的能量
   toxin_penalty: -0.5     # 站在毒物格子的惩罚
   toxin_health: -2.0      # 毒物对健康扣减

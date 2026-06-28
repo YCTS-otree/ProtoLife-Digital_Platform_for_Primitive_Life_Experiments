@@ -5,7 +5,7 @@
 实时监控一个或多个 JSONL log 文件，并刷新显示 agent_count 与 step 的关系。
 
 特点：
-- 支持多个续训 log 合并显示；
+- 支持多个续训 log 合并显示，重叠 step 采用创建时间较晚的文件；
 - 文件 size/mtime 变化后自动重读并刷新；
 - X 轴窗口最多显示 X_WINDOW_STEPS 个 step；
 - 默认跟随最新 step；
@@ -63,6 +63,7 @@ class LogData:
     steps: list[int] = field(default_factory=list)
     counts: list[int] = field(default_factory=list)
     meta: dict[str, Any] = field(default_factory=dict)
+    created_at_ns: int = 0
     input_order: int = 0
 
     @property
@@ -258,25 +259,25 @@ def read_log(log_path: Path, input_order: int = 0, quiet: bool = False) -> LogDa
         steps=[x[0] for x in data],
         counts=[x[1] for x in data],
         meta=meta,
+        created_at_ns=file_creation_time_ns(log_path),
         input_order=input_order,
     )
 
 
+def file_creation_time_ns(path: Path) -> int:
+    """返回文件创建时间；不支持 birth time 的系统回退到 st_ctime。"""
+
+    stat = path.stat()
+    birthtime = getattr(stat, "st_birthtime", None)
+    if birthtime is not None:
+        return int(birthtime * 1_000_000_000)
+    return stat.st_ctime_ns
+
+
 def chronological_key(log: LogData) -> tuple[int, int]:
-    candidates: list[int] = []
+    """旧文件先合并、新文件后合并，使重叠 step 采用较晚创建的文件。"""
 
-    for key in ("start_step", "resumed_from_step"):
-        value = log.meta.get(key)
-        if isinstance(value, int):
-            candidates.append(value)
-
-    if log.first_step is not None:
-        candidates.append(log.first_step)
-
-    if candidates:
-        return min(candidates), log.input_order
-
-    return 10**18, log.input_order
+    return log.created_at_ns, log.input_order
 
 
 def combine_logs(logs: list[LogData]) -> tuple[list[int], list[int], list[LogData]]:

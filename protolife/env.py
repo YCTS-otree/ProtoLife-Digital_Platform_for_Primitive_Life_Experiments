@@ -85,7 +85,10 @@ ENV_DEFAULTS = {
     "features": {"use_death": True, "use_health": True},
     "rewards": {
         "survival_reward": 0.0001,
-        "food_reward": 1.0,
+        "food_reward_min": 0.1,
+        "food_reward_max": 1.0,
+        "food_reward_mode": "log",
+        "food_reward_coefficient": 4.0,
         "food_energy": 10.0,
         "toxin_penalty": -0.5,
         "toxin_health": -5.0,
@@ -621,7 +624,8 @@ class ProtoLifeEnv:
         food_mask = (current_cells & BIT_FOOD).bool()
         eat_success = eat_mask & food_mask
         failed_eat = eat_mask & (~food_mask)
-        rewards = torch.where(eat_success, rewards + self._get("rewards", "food_reward", ENV_DEFAULTS["rewards"]["food_reward"]), rewards)
+        food_reward = self._compute_food_reward(energy)
+        rewards = torch.where(eat_success, rewards + food_reward, rewards)
         rewards = torch.where(failed_eat, rewards + self._get("rewards", "failed_eat_penalty", ENV_DEFAULTS["rewards"]["failed_eat_penalty"]), rewards)
         energy = torch.where(
             eat_success,
@@ -712,6 +716,48 @@ class ProtoLifeEnv:
         if mode in {"invlog", "inverse_log"}:
             return torch.expm1(coeff * normalized) / math.expm1(coeff)
         return normalized
+
+    def _compute_food_reward(self, energy: torch.Tensor) -> torch.Tensor:
+        """按进食前能量计算奖励；能量越低，成功进食奖励越高。"""
+
+        configured = self.config.get("rewards", {})
+        defaults = self.default_config.get("rewards", {})
+        dynamic_keys = {"food_reward_min", "food_reward_max"}
+
+        # 旧模型配置只有 food_reward 时保持原来的固定奖励，避免续训语义突变。
+        if not dynamic_keys.intersection(configured) and "food_reward" in configured:
+            return torch.full_like(energy, float(configured["food_reward"]))
+        if (
+            not dynamic_keys.intersection(configured)
+            and not dynamic_keys.intersection(defaults)
+            and "food_reward" in defaults
+        ):
+            return torch.full_like(energy, float(defaults["food_reward"]))
+
+        reward_min = float(
+            self._get("rewards", "food_reward_min", ENV_DEFAULTS["rewards"]["food_reward_min"])
+        )
+        reward_max = float(
+            self._get("rewards", "food_reward_max", ENV_DEFAULTS["rewards"]["food_reward_max"])
+        )
+        if reward_max < reward_min:
+            raise ValueError("rewards.food_reward_max 不能小于 food_reward_min")
+        if self.energy_max <= 0:
+            return torch.full_like(energy, reward_max)
+
+        scarcity = 1.0 - torch.clamp(energy / self.energy_max, 0.0, 1.0)
+        mode = str(
+            self._get("rewards", "food_reward_mode", ENV_DEFAULTS["rewards"]["food_reward_mode"])
+        ).lower()
+        coefficient = float(
+            self._get(
+                "rewards",
+                "food_reward_coefficient",
+                ENV_DEFAULTS["rewards"]["food_reward_coefficient"],
+            )
+        )
+        curve = self._apply_curve(scarcity, mode, coefficient)
+        return reward_min + curve * (reward_max - reward_min)
 
     def _interpolate_reward(
         self, normalized: torch.Tensor, start_value: float, end_value: float, mode: str, coefficient: float
