@@ -23,6 +23,7 @@ class ExperimentLogger:
         metadata: Optional[Dict] = None,
         buffer_on_gpu: bool = False,
         flush_interval: int = 8,
+        start_step: int = 0,
     ):
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
@@ -36,31 +37,44 @@ class ExperimentLogger:
         tag = self.run_tag or time.strftime("%Y%m%d_%H%M%S")
         self.map_log = self.save_dir / f"{tag}_map.log"
         self.agent_log = self.save_dir / f"{tag}_agents.jsonl"
-        self.step_counter = 0
+        self.step_counter = int(start_step)
+        self.metadata.setdefault("start_step", self.step_counter)
         self._write_header()
 
-    def maybe_log(self, map_state: torch.Tensor, agent_state: torch.Tensor) -> None:
-        """按照间隔写入快照。"""
+    def maybe_log(
+        self,
+        map_state: torch.Tensor,
+        agent_state: torch.Tensor,
+        *,
+        step: int | None = None,
+    ) -> None:
+        """按照真实训练步数写入快照。"""
 
-        if self.step_counter % self.snapshot_interval == 0:
+        current_step = self.step_counter if step is None else int(step)
+        if current_step % self.snapshot_interval == 0:
             map_snapshot = map_state[self.env_index : self.env_index + 1].detach().clone()
             agent_snapshot = agent_state[self.env_index : self.env_index + 1].detach().clone()
             if self.buffer_on_gpu:
-                self._gpu_buffer.append((map_snapshot, agent_snapshot, self.step_counter))
+                self._gpu_buffer.append((map_snapshot, agent_snapshot, current_step))
                 if len(self._gpu_buffer) >= self.flush_interval:
                     self._flush_buffer()
             else:
-                self._write_snapshot(map_snapshot.cpu(), agent_snapshot.cpu(), self.step_counter)
-        self.step_counter += 1
+                self._write_snapshot(map_snapshot.cpu(), agent_snapshot.cpu(), current_step)
+        self.step_counter = current_step + 1
 
     def _write_snapshot(self, map_state: torch.Tensor, agent_state: torch.Tensor, step: int) -> None:
         encoded = encode_grid(map_state)
         with self.map_log.open("a", encoding="utf-8") as f:
             f.write(encoded + "\n")
 
+        agents = agent_state[0].cpu()
+        alive = agents[:, 2] > 0
+        if bool(self.metadata.get("use_health", True)):
+            alive = alive & (agents[:, 3] > 0)
         record = {
             "step": step,
-            "agents": agent_state[0].cpu().tolist(),
+            "agent_count": int(alive.sum().item()),
+            "agents": agents.tolist(),
         }
         with self.agent_log.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")

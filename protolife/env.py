@@ -53,13 +53,17 @@ ENV_DEFAULTS = {
     "model": {
         "observation_radius": 2,
         "use_cnn": False,
+        "cnn_independent": True,
         "cnn_channels": [32, 64],
         "cnn_feature_dim": 128,
+        "cnn_pooling": True,
+        "cnn_pool_size": [8, 8],
         "rnn_hidden_dim": 128,
         "rnn_type": "gru",
     },
     "agents": {
         "per_env": 32,
+        "max_per_env": 64,
         "base_energy": 50,
         "base_health": 100,
         "energy_max": 100,
@@ -108,10 +112,15 @@ ENV_DEFAULTS = {
         "health_decay_mode": "linear",
         "health_decay_coefficient": 1.0,
         "communication_receive_reward": 0.0,
+        "move_collision_penalty": -0.02,
     },
     "communication": {"radius": 2, "base_strength": 1.0},
     "combat": {"damage": 10.0, "radius": 2.0, "decay": "none"},
-    "reproduction": {"health_cost": 5.0},
+    "reproduction": {
+        "health_cost": 5.0,
+        "policy_mutation_std": 0.01,
+        "success_probability": 0.8,
+    },
 }
 
 
@@ -123,6 +132,7 @@ class EnvStepResult:
     rewards: torch.Tensor
     dones: torch.Tensor
     infos: List[Dict]
+    reproduction_events: List[Tuple[int, int, int]]
 
 
 class ProtoLifeEnv:
@@ -245,9 +255,24 @@ class ProtoLifeEnv:
         self.action_energy_costs = build_action_energy_cost_table(action_energy_cfg).to(self.device)
         self.rnn_hidden_dim = int(self._get("model", "rnn_hidden_dim", 0))
         self.rnn_type = str(self._get("model", "rnn_type", "gru")).lower()
+        self.initial_agents_per_env = int(
+            self._get("agents", "per_env", ENV_DEFAULTS["agents"]["per_env"])
+        )
+        configured_agents = config.get("agents", {})
+        if "max_per_env" in configured_agents:
+            max_agents = configured_agents["max_per_env"]
+        elif "per_env" in configured_agents:
+            max_agents = self.initial_agents_per_env
+        else:
+            max_agents = default_config.get("agents", {}).get(
+                "max_per_env", self.initial_agents_per_env
+            )
+        self.max_agents_per_env = int(max_agents)
+        if self.max_agents_per_env < self.initial_agents_per_env:
+            raise ValueError("agents.max_per_env 不能小于 agents.per_env")
         self.agent_batch = AgentBatch(
             num_envs=self._get("training", "num_envs", ENV_DEFAULTS["training"]["num_envs"]),
-            agents_per_env=self._get("agents", "per_env", ENV_DEFAULTS["agents"]["per_env"]),
+            agents_per_env=self.max_agents_per_env,
             device=self.device,
             memory_dim=self.rnn_hidden_dim,
             use_lstm=self.rnn_type == "lstm",
@@ -314,7 +339,9 @@ class ProtoLifeEnv:
             base_health=self._get("agents", "base_health", ENV_DEFAULTS["agents"]["base_health"]),
             energy_max=self.energy_max,
             health_max=self.health_max,
+            initial_agents=self.initial_agents_per_env,
         )
+        self._relocate_agents_inside_walls()
         return self._build_observations()
 
     def step(self, actions: torch.Tensor) -> EnvStepResult:
@@ -328,12 +355,20 @@ class ProtoLifeEnv:
         """
 
         actions_2d = actions.view(self.agent_batch.num_envs, self.agent_batch.agents_per_env)
+        alive_at_start = self._alive_mask()
+        actions_2d = torch.where(alive_at_start, actions_2d, torch.zeros_like(actions_2d))
+        reproduction_events: List[Tuple[int, int, int]] = []
         self.step_count += 1
-        move_info = self.agent_batch.apply_actions(actions_2d, self.height, self.width, self.map_state)
+        move_info = self.agent_batch.apply_actions(
+            actions_2d, self.height, self.width, self.map_state, active_mask=alive_at_start
+        )
+        reproduction_mask = actions_2d == 10
         base_rewards = self.action_rewards[actions_2d]
 
         rewards = base_rewards.view(self.agent_batch.num_envs, self.agent_batch.agents_per_env)
         rewards = rewards.clone()
+        # 繁殖奖励必须在确实创建子代后结算；仅尝试繁殖不产生动作奖励。
+        rewards = torch.where(reproduction_mask, torch.zeros_like(rewards), rewards)
         energy = self.agent_batch.state["energy"]
         health = self.agent_batch.state["health"]
         x = self.agent_batch.state["x"]
@@ -361,6 +396,11 @@ class ProtoLifeEnv:
                     torch.zeros_like(self.agent_batch.state["comm"]),
                 )
                 aggregated = broadcast_messages(messages, positions, comm_radius, comm_strength)
+                aggregated = torch.where(
+                    alive_at_start.unsqueeze(-1),
+                    aggregated,
+                    torch.zeros_like(aggregated),
+                )
                 self.agent_batch.state["comm"] = aggregated
             comm_reward = float(
                 self._get(
@@ -392,7 +432,14 @@ class ProtoLifeEnv:
                 ).lower()
                 positions = torch.stack([x, y], dim=-1).float()
                 distances = torch.cdist(positions, positions, p=2)
-                valid = (distances <= attack_radius) & (distances > 0)
+                attacker_alive = alive_at_start.unsqueeze(2)
+                target_alive = alive_at_start.unsqueeze(1)
+                valid = (
+                    (distances <= attack_radius)
+                    & (distances > 0)
+                    & attacker_alive
+                    & target_alive
+                )
 
                 if decay_mode == "log":
                     damage_scale = attack_damage / (
@@ -406,7 +453,8 @@ class ProtoLifeEnv:
                     damage_scale = torch.where(valid, torch.full_like(distances, attack_damage), torch.zeros_like(distances))
 
                 damage_scale = torch.where(valid, damage_scale, torch.zeros_like(damage_scale))
-                attacker_mask = attack_mask.unsqueeze(1).expand_as(damage_scale)
+                # 行表示攻击者、列表示目标；空闲槽位不能攻击，也不能成为目标。
+                attacker_mask = attack_mask.unsqueeze(2).expand_as(damage_scale)
                 total_damage = (attacker_mask * damage_scale).sum(dim=1)
                 health.sub_(total_damage)
 
@@ -415,14 +463,24 @@ class ProtoLifeEnv:
         move_cost = self._get("agents", "move_cost", ENV_DEFAULTS["agents"]["move_cost"])
         action_cost = self.action_energy_costs[actions_2d]
         energy_cost = base_metabolism + move_cost * move_info["moved"].float() + action_cost
+        energy_cost = torch.where(
+            alive_at_start, energy_cost, torch.zeros_like(energy_cost)
+        )
         energy.sub_(energy_cost)
 
-        # 撞墙轻微惩罚
-        rewards = torch.where(move_info["collided"], rewards - 0.6, rewards)
+        # 移动失败不获得 MOVE 奖励，直接替换为可配置的小额惩罚。
+        movement_mask = (actions_2d >= 1) & (actions_2d <= 4)
+        failed_movement = movement_mask & move_info["collided"]
+        collision_penalty = float(
+            self._get("rewards", "move_collision_penalty", ENV_DEFAULTS["rewards"]["move_collision_penalty"])
+        )
+        rewards = torch.where(
+            failed_movement, torch.full_like(rewards, collision_penalty), rewards
+        )
 
         # 繁衍：满足能量阈值时在空闲插槽生成子代，并扣除健康值
         if self._get("features", "use_reproduction", True):
-            reproduction_mask = actions_2d == 10
+            reproduction_success = torch.zeros_like(reproduction_mask)
             threshold = self._get(
                 "agents",
                 "reproduction_energy_threshold",
@@ -437,18 +495,30 @@ class ProtoLifeEnv:
                 else 0.0
             )
             eligible = reproduction_mask & can_reproduce(energy, threshold)
+            success_probability = float(
+                self._get(
+                    "reproduction",
+                    "success_probability",
+                    ENV_DEFAULTS["reproduction"]["success_probability"],
+                )
+            )
+            success_probability = min(max(success_probability, 0.0), 1.0)
+            successful_attempts = eligible & (
+                torch.rand_like(energy) < success_probability
+            )
 
             for env_idx in range(self.agent_batch.num_envs):
-                parents = torch.nonzero(eligible[env_idx], as_tuple=False).view(-1)
+                parents = torch.nonzero(successful_attempts[env_idx], as_tuple=False).view(-1)
                 if parents.numel() == 0:
                     continue
                 if self.use_death:
-                    dead_mask = energy[env_idx] <= 0
+                    available_mask = energy[env_idx] <= 0
                     if self.use_health:
-                        dead_mask = dead_mask | (health[env_idx] <= 0)
-                    dead_slots = torch.nonzero(dead_mask, as_tuple=False).view(-1)
+                        available_mask = available_mask | (health[env_idx] <= 0)
                 else:
-                    dead_slots = torch.tensor([], dtype=torch.int64, device=self.device)
+                    # 死亡机制关闭时仍允许使用尚未激活的容量槽位。
+                    available_mask = (energy[env_idx] <= 0) & (health[env_idx] <= 0)
+                dead_slots = torch.nonzero(available_mask, as_tuple=False).view(-1)
                 if dead_slots.numel() == 0:
                     continue
 
@@ -475,6 +545,20 @@ class ProtoLifeEnv:
                     self.agent_batch.state["genome_id"][env_idx, child_idx] = self.agent_batch.state[
                         "genome_id"
                     ][env_idx, parent_idx]
+                    if "memory" in self.agent_batch.state:
+                        self.agent_batch.state["memory"][env_idx, child_idx].zero_()
+                    if "memory_cell" in self.agent_batch.state:
+                        self.agent_batch.state["memory_cell"][env_idx, child_idx].zero_()
+                    reproduction_success[env_idx, parent_idx] = True
+                    reproduction_events.append(
+                        (int(env_idx), int(parent_idx.item()), int(child_idx.item()))
+                    )
+
+            rewards = torch.where(
+                reproduction_success,
+                rewards + self.action_rewards[10],
+                rewards,
+            )
 
         # 交互：食物/毒素
         env_ids = torch.arange(self.agent_batch.num_envs, device=self.device).unsqueeze(1).expand_as(actions_2d)
@@ -546,7 +630,7 @@ class ProtoLifeEnv:
         )
         self.map_state[env_ids, y, x] = torch.where(eat_success, current_cells & (~BIT_FOOD), current_cells)
 
-        toxin_mask = (current_cells & BIT_TOXIN).bool()
+        toxin_mask = (current_cells & BIT_TOXIN).bool() & alive_at_start
         eat_on_toxin = eat_mask & toxin_mask
         rewards = torch.where(toxin_mask, rewards + self._get("rewards", "toxin_penalty", ENV_DEFAULTS["rewards"]["toxin_penalty"]), rewards)
         rewards = torch.where(
@@ -573,8 +657,9 @@ class ProtoLifeEnv:
         if self.use_health:
             self.agent_batch.state["health"] = health
 
-        # 生存奖励，鼓励活着
+        # 生存奖励只发给本步开始时存活的个体。
         rewards += self._get("rewards", "survival_reward", ENV_DEFAULTS["rewards"]["survival_reward"])
+        rewards = torch.where(alive_at_start, rewards, torch.zeros_like(rewards))
 
         # 周期性刷新资源/毒素
         self._maybe_respawn_resources()
@@ -609,7 +694,13 @@ class ProtoLifeEnv:
                 use_death=self.use_death,
             )
 
-        return EnvStepResult(observations=observations, rewards=rewards.view(-1), dones=dones.view(-1), infos=infos)
+        return EnvStepResult(
+            observations=observations,
+            rewards=rewards.view(-1),
+            dones=dones.view(-1),
+            infos=infos,
+            reproduction_events=reproduction_events,
+        )
 
     def _apply_curve(self, normalized: torch.Tensor, mode: str, coefficient: float) -> torch.Tensor:
         """根据模式调整 [0,1] 归一化值的曲线形状。"""
@@ -720,6 +811,8 @@ class ProtoLifeEnv:
             "map": self.map_state.clone(),
             "agents": agent_state,
             "agent_obs": agent_obs,
+            "agent_features": agent_features[..., 2:5],  # 能量、健康、年龄
+            "alive": self._alive_mask(),
             "patch": patch,
         }
 
@@ -736,6 +829,7 @@ class ProtoLifeEnv:
             "map_state": self.map_state.detach().cpu(),
             "agent_state": self.agent_batch.state_dict(),
             "toxin_age": self.toxin_age.detach().cpu(),
+            "step_count": torch.tensor(self.step_count, dtype=torch.int64),
         }
 
     def load_state(self, state: Dict[str, torch.Tensor]) -> None:
@@ -744,7 +838,40 @@ class ProtoLifeEnv:
         self.map_state = state["map_state"].to(self.device)
         self._map_template = self.map_state[:1].clone()
         self.agent_batch.load_state_dict(state["agent_state"], self.height, self.width)
+        self._relocate_agents_inside_walls()
         self.toxin_age = state.get("toxin_age", torch.zeros_like(self.map_state)).to(self.device)
+        saved_step = state.get("step_count")
+        self.step_count = int(saved_step.item()) if saved_step is not None else 0
+
+    def _alive_mask(self) -> torch.Tensor:
+        energy = self.agent_batch.state["energy"]
+        alive = energy > 0
+        if self.use_health:
+            alive = alive & (self.agent_batch.state["health"] > 0)
+        return alive
+
+    def _relocate_agents_inside_walls(self) -> None:
+        """把随机出生或旧存档中位于墙内的个体移动到可通行格。"""
+
+        x = self.agent_batch.state["x"]
+        y = self.agent_batch.state["y"]
+        for env_idx in range(self.agent_batch.num_envs):
+            wall_grid = (self.map_state[env_idx] & BIT_TERRAIN_0).bool()
+            inside_wall = wall_grid[y[env_idx], x[env_idx]]
+            invalid_slots = torch.nonzero(inside_wall, as_tuple=False).view(-1)
+            if invalid_slots.numel() == 0:
+                continue
+            walkable = torch.nonzero(~wall_grid, as_tuple=False)
+            if walkable.numel() == 0:
+                raise ValueError(f"环境 {env_idx} 的地图没有可供个体出生的通行格")
+            choices = torch.randint(
+                walkable.size(0),
+                (invalid_slots.numel(),),
+                device=self.device,
+            )
+            positions = walkable[choices]
+            y[env_idx, invalid_slots] = positions[:, 0]
+            x[env_idx, invalid_slots] = positions[:, 1]
 
     def _load_map_template(self) -> torch.Tensor:
         """加载单张地图模板，若未指定则返回全零地图。"""
@@ -1026,7 +1153,12 @@ class ProtoLifeEnv:
 
         agent_grid = torch.zeros_like(self.map_state, dtype=torch.float32)
         env_ids = torch.arange(self.agent_batch.num_envs, device=self.device).unsqueeze(1).expand_as(self.agent_batch.state["x"])
-        agent_grid[env_ids, self.agent_batch.state["y"], self.agent_batch.state["x"]] = 1.0
+        alive = self._alive_mask()
+        agent_grid[
+            env_ids[alive],
+            self.agent_batch.state["y"][alive],
+            self.agent_batch.state["x"][alive],
+        ] = 1.0
 
         return torch.stack([terrain, buildable, food, toxin, resource, agent_grid], dim=1)
 
@@ -1075,6 +1207,7 @@ class GridRenderer:
         self.show_dead_markers = show_dead_markers
         self.dead_marker_lifetime = int(dead_marker_lifetime)
         self._death_steps: torch.Tensor | None = None
+        self._seen_alive: torch.Tensor | None = None
         plt.ion()
         self.fig, self.ax = plt.subplots()
         self.img = None
@@ -1119,11 +1252,13 @@ class GridRenderer:
         if self.show_dead_markers and step is not None and self.dead_marker_lifetime > 0 and use_death:
             if self._death_steps is None or self._death_steps.numel() != alive_mask.numel():
                 self._death_steps = torch.full_like(alive_mask, -1, dtype=torch.int64)
-            died_now = (~alive_mask) & (self._death_steps < 0)
+                self._seen_alive = torch.zeros_like(alive_mask, dtype=torch.bool)
+            died_now = self._seen_alive & (~alive_mask) & (self._death_steps < 0)
             self._death_steps[died_now] = int(step)
             revived = alive_mask & (self._death_steps >= 0)
             self._death_steps[revived] = -1
-            show_dead = (~alive_mask) & (self._death_steps >= 0) & (
+            self._seen_alive = self._seen_alive | alive_mask
+            show_dead = self._seen_alive & (~alive_mask) & (self._death_steps >= 0) & (
                 (int(step) - self._death_steps) < self.dead_marker_lifetime
             )
             if show_dead.any():
@@ -1135,5 +1270,5 @@ class GridRenderer:
                     marker="x",
                 )
         if self.show_step and step is not None:
-            self.ax.set_title(f"Step: {step}")
+            self.ax.set_title(f"Step: {step} | Agents: {int(alive_mask.sum().item())}")
         plt.pause(0.001)

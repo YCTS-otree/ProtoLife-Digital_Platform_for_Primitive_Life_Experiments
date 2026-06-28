@@ -59,8 +59,9 @@ class AgentBatch:
         base_health: float = 100,
         energy_max: float | None = None,
         health_max: float | None = None,
+        initial_agents: int | None = None,
     ) -> None:
-        """随机初始化个体位置与基本状态。"""
+        """随机初始化个体位置，仅激活 initial_agents 个槽位。"""
 
         self.state["x"].random_(0, width)
         self.state["y"].random_(0, height)
@@ -68,20 +69,38 @@ class AgentBatch:
         health_value = base_health if health_max is None else min(base_health, health_max)
         self.state["energy"].fill_(energy_value)
         self.state["health"].fill_(health_value)
+        active_count = self.agents_per_env if initial_agents is None else int(initial_agents)
+        if active_count < 0 or active_count > self.agents_per_env:
+            raise ValueError("initial_agents 必须位于 0 与最大个体数之间")
+        if active_count < self.agents_per_env:
+            self.state["energy"][:, active_count:].zero_()
+            self.state["health"][:, active_count:].zero_()
         self.state["age"].zero_()
         self.state["mood"].zero_()
         self.state["comm"].zero_()
-        self.state["genome_id"].zero_()
+        genome_ids = torch.arange(self.agents_per_env, device=self.device, dtype=torch.int64)
+        self.state["genome_id"] = genome_ids.unsqueeze(0).expand(self.num_envs, -1).clone()
         self.state["generation"].zero_()
         if "memory" in self.state:
             self.state["memory"].zero_()
         if "memory_cell" in self.state:
             self.state["memory_cell"].zero_()
 
-    def apply_actions(self, actions: torch.Tensor, height: int, width: int, map_state: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """根据动作更新坐标，仅处理移动并返回移动/碰撞信息。"""
+    def apply_actions(
+        self,
+        actions: torch.Tensor,
+        height: int,
+        width: int,
+        map_state: torch.Tensor,
+        active_mask: torch.Tensor | None = None,
+    ) -> Dict[str, torch.Tensor]:
+        """根据动作更新坐标；未激活槽位不会移动或增长年龄。"""
 
         actions = actions.view(self.num_envs, self.agents_per_env)
+        if active_mask is None:
+            active_mask = torch.ones_like(actions, dtype=torch.bool)
+        else:
+            active_mask = active_mask.view_as(actions).bool()
         dx = torch.zeros_like(actions)
         dy = torch.zeros_like(actions)
         dx = torch.where(actions == 3, -1, dx)  # 左
@@ -91,23 +110,21 @@ class AgentBatch:
 
         proposed_x = self.state["x"] + dx
         proposed_y = self.state["y"] + dy
-
         clamped_x = proposed_x.clamp(0, width - 1)
         clamped_y = proposed_y.clamp(0, height - 1)
         out_of_bounds = (proposed_x != clamped_x) | (proposed_y != clamped_y)
 
         env_ids = torch.arange(self.num_envs, device=self.device).unsqueeze(1).expand_as(actions)
         wall_mask = (map_state[env_ids, clamped_y, clamped_x] & 1).bool()
-        collision_mask = wall_mask | out_of_bounds
-
-        new_x = torch.where(collision_mask, self.state["x"], clamped_x)
-        new_y = torch.where(collision_mask, self.state["y"], clamped_y)
-        moved = (new_x != self.state["x"]) | (new_y != self.state["y"])
+        collision_mask = (wall_mask | out_of_bounds) & active_mask
+        blocked = collision_mask | (~active_mask)
+        new_x = torch.where(blocked, self.state["x"], clamped_x)
+        new_y = torch.where(blocked, self.state["y"], clamped_y)
+        moved = ((new_x != self.state["x"]) | (new_y != self.state["y"])) & active_mask
 
         self.state["x"] = new_x
         self.state["y"] = new_y
-        self.state["age"] += 1
-
+        self.state["age"] += active_mask.to(self.state["age"].dtype)
         return {"moved": moved, "collided": collision_mask}
 
     def export_state(self) -> torch.Tensor:
@@ -130,21 +147,20 @@ class AgentBatch:
         return {k: v.detach().cpu() for k, v in self.state.items()}
 
     def load_state_dict(self, state_dict: Dict[str, torch.Tensor], height: int, width: int) -> None:
-        """从 checkpoint 恢复内部状态，并确保尺寸匹配当前环境。"""
+        """恢复状态；容量变化时自动截断或用空槽位补齐。"""
 
-        self.state = {k: v.to(self.device) for k, v in state_dict.items()}
-        base_shape = (self.num_envs, self.agents_per_env)
-        mem_shape = base_shape + (self.memory_dim,)
-        if self.memory_dim > 0:
-            memory = self.state.get("memory")
-            if memory is None or memory.shape != mem_shape:
-                self.state["memory"] = torch.zeros(mem_shape, dtype=torch.float32, device=self.device)
-            if self.use_lstm:
-                memory_cell = self.state.get("memory_cell")
-                if memory_cell is None or memory_cell.shape != mem_shape:
-                    self.state["memory_cell"] = torch.zeros(mem_shape, dtype=torch.float32, device=self.device)
-
-        if self.state["x"].shape != base_shape:
-            raise ValueError("载入的个体状态尺寸与当前设置不一致")
-        self.state["x"] = self.state["x"].clamp(0, width - 1)
-        self.state["y"] = self.state["y"].clamp(0, height - 1)
+        fresh_state = self._allocate_state()
+        for key, target in fresh_state.items():
+            source = state_dict.get(key)
+            if source is None:
+                continue
+            source = source.to(self.device)
+            if source.ndim < 2 or source.size(0) != self.num_envs:
+                continue
+            if source.shape[2:] != target.shape[2:]:
+                continue
+            copy_agents = min(source.size(1), self.agents_per_env)
+            target[:, :copy_agents].copy_(source[:, :copy_agents])
+        self.state = fresh_state
+        self.state["x"].clamp_(0, width - 1)
+        self.state["y"].clamp_(0, height - 1)

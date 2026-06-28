@@ -23,21 +23,25 @@ world:
 model:
   observation_radius: 6  # 每个体可见半径 r
   use_cnn: true  # 是否使用 CNN+RNN 结构（默认开启，关闭时回退到简单 MLP）
-  cnn_channels: [32, 64]  # 卷积层通道数列表，可按需加深
-  cnn_feature_dim: 256  # 卷积输出展平后的线性投影维度
-  rnn_hidden_dim: 128  # GRU/LSTM 隐状态维度（同时也是 Agent 记忆张量维度）
+  cnn_independent: true  # 每个个体使用完全独立的 CNN+RNN 参数，不共享大脑
+  cnn_channels: [32, 64, 128, 256]  # 卷积层通道数列表，可按需加深
+  cnn_feature_dim: 1024  # 卷积输出展平后的线性投影维度
+  cnn_pooling: true  # 是否在卷积后启用自适应平均池化
+  cnn_pool_size: [8, 8]  # 池化输出尺寸 [高, 宽]
+  rnn_hidden_dim: 512  # GRU/LSTM 隐状态维度（同时也是 Agent 记忆张量维度）
   rnn_type: gru  # gru 或 lstm，决定短期记忆类型
   hidden: 16384  # MLP 回退模式下的隐藏层宽度
 
 # 个体初始与代谢参数
 agents:
-  per_env: 4  # 每个环境中的个体数
-  base_energy: 50  # 初始能量
+  per_env: 32  # 每个环境的初始个体数
+  max_per_env: 64  # 每个环境允许达到的最大个体数（预分配容量）
+  base_energy: 95  # 初始能量
   energy_max: 100  # 能量上限
   base_health: 100  # 初始健康
   health_max: 100  # 健康上限
-  base_metabolism_cost: 0.1  # 每步基础代谢消耗
-  move_cost: 0.1  # 移动额外能量消耗
+  base_metabolism_cost: 0.025  # 每步基础代谢消耗
+  move_cost: 0.002  # 移动额外能量消耗
   communication_cost: 0.1  # 通信能量消耗（预留）
   reproduction_energy_threshold: 80  # 繁衍能量阈值
   child_energy_fraction: 0.3  # 子代获得的亲代能量比例
@@ -45,7 +49,7 @@ agents:
 
 # 通信/战斗参数
 communication:
-  radius: 2  # 信号作用半径
+  radius: 3  # 信号作用半径
   base_strength: 1.0  # 信号初始强度，对数衰减
 
 combat:
@@ -55,6 +59,8 @@ combat:
 
 reproduction:
   health_cost: 5.0  # 繁衍成功后父代扣除的健康值
+  policy_mutation_std: 0.01  # 子代继承父代策略头时叠加的高斯变异标准差
+  success_probability: 0.8  # 每次满足条件的繁殖尝试成功概率，范围 0~1
 
 # 训练超参与调试开关
 training:
@@ -69,6 +75,8 @@ training:
     epsilon: 0.001  # 以 epsilon 概率使用均匀随机动作（epsilon-greedy）
   save_interval: 4096  # 模型/存档保存间隔
   checkpoint_dir: K:/Proto_Digital_Life/checkpoints  # checkpoint 输出目录
+  initial_model: null  # 可选的单个体初始模型；为空时使用随机初始化，填写后复制给全部个体
+  auto_resume: true  # 默认自动恢复模型目录中最新的完整 checkpoint；设为 false 可强制新训练
   print_actions: false  # 是否打印每步动作，便于调试
   print_interval: 256  # 进度打印间隔（步数）
 
@@ -83,13 +91,13 @@ features:
 
 # 日志与可视化设置
 logging:
-  snapshot_interval: 16  # 记录快照的步间隔
+  snapshot_interval: 1  # 记录快照的步间隔
   realtime_render: false  # 是否开启实时渲染
   save_dir: runs/default  # 日志目录
   env_index: 0  # 多环境时选择写入第几个环境的快照
   agent_marker_size: 20  # 实时/回放中个体散点尺寸（matplotlib scatter 的 s）
   snapshot_gpu_stage: true  # 是否先将快照留在 GPU，批量写回 CPU
-  snapshot_flush_interval: 32  # GPU 暂存的快照数量，达到后批量写回
+  snapshot_flush_interval: 1024  # GPU 暂存的快照数量，达到后批量写回
   show_step: true  # 实时渲染时是否展示 step 计数
 
 # 动作基础奖励表
@@ -122,6 +130,7 @@ rewards:
   toxin_penalty: -0.5     # 站在毒物格子的惩罚
   toxin_health: -2.0      # 毒物对健康扣减
   failed_eat_penalty: -0.005  # 使用 EAT 但当前格没有食物的惩罚
+  move_collision_penalty: -0.02  # 移动撞墙或越界时的动作奖励（替代 MOVE 奖励）
   toxin_eat_penalty: -0.4    # 在毒物格执行 EAT 额外惩罚
   enable_proximity_reward: true  # 是否启用视野内食物距离奖励
   see_food_reward: 0.001          # 视野中发现食物的基础奖励（距离衰减前）

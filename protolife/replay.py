@@ -157,6 +157,7 @@ def playback(target: str, interval: float = 0.2) -> None:
         reader = ReplayReader(map_log, agent_log)
         marker_size = _resolve_marker_size(reader)
         death_steps: torch.Tensor | None = None
+        seen_alive: torch.Tensor | None = None
         try:
             height, width = _extract_expected_shape(reader.metadata)
         except ValueError:
@@ -192,17 +193,21 @@ def playback(target: str, interval: float = 0.2) -> None:
             ys = agent_state[..., 1].view(-1)
             energies = agent_state[..., 2].view(-1)
             healths = agent_state[..., 3].view(-1)
-            alive_mask = (energies > 0) & (healths > 0)
+            alive_mask = energies > 0
+            if bool(reader.agent_metadata.get("use_health", True)):
+                alive_mask = alive_mask & (healths > 0)
             ax.scatter(xs[alive_mask], ys[alive_mask], c="red", s=marker_size)
             step = int(agent_data.get("step", 0))
             if show_dead_markers and dead_marker_lifetime > 0:
                 if death_steps is None or death_steps.numel() != alive_mask.numel():
                     death_steps = torch.full_like(alive_mask, -1, dtype=torch.int64)
-                died_now = (~alive_mask) & (death_steps < 0)
+                    seen_alive = torch.zeros_like(alive_mask, dtype=torch.bool)
+                died_now = seen_alive & (~alive_mask) & (death_steps < 0)
                 death_steps[died_now] = step
                 revived = alive_mask & (death_steps >= 0)
                 death_steps[revived] = -1
-                show_dead = (~alive_mask) & (death_steps >= 0) & (
+                seen_alive = seen_alive | alive_mask
+                show_dead = seen_alive & (~alive_mask) & (death_steps >= 0) & (
                     (step - death_steps) < dead_marker_lifetime
                 )
                 if show_dead.any():
@@ -213,7 +218,11 @@ def playback(target: str, interval: float = 0.2) -> None:
                         s=marker_size,
                         marker="x",
                     )
-            ax.set_title(f"step {agent_data.get('step', 0)} | {map_log.name}")
+            agent_count = int(agent_data.get("agent_count", alive_mask.sum().item()))
+            start_step = int(reader.agent_metadata.get("start_step", 0))
+            ax.set_title(
+                f"step {step} | agents {agent_count} | start {start_step} | {map_log.name}"
+            )
             plt.pause(interval)
 
     plt.ioff()

@@ -14,7 +14,7 @@ from pathlib import Path
 import torch
 import yaml
 
-from protolife.config_loader import load_config
+from protolife.config_loader import load_config, save_config_with_comments
 from protolife.checkpoint import load_checkpoint, save_checkpoint
 from protolife.env import ProtoLifeEnv
 from protolife.policy import action_space, build_policy
@@ -25,6 +25,8 @@ TRAIN_DEFAULTS = {
     "world": {"random_seed": 0},
     "training": {
         "checkpoint_dir": "checkpoints",
+        "initial_model": None,
+        "auto_resume": True,
         "rollout_steps": 128,
         "save_interval": 100,
         "entropy_coef": 0.01,
@@ -51,12 +53,100 @@ def _load_state_dict_lenient(model: torch.nn.Module, state_dict: dict) -> bool:
         compatible[key] = tensor
 
     model.load_state_dict(compatible, strict=False)
+    missing_keys = [key for key in current if key not in compatible]
     if dropped_keys:
         print(
             "[警告] 以下权重尺寸不匹配，已跳过加载（可能是 observation_radius 调整导致）：",
             dropped_keys,
         )
-    return bool(dropped_keys)
+    if missing_keys:
+        print(f"[警告] checkpoint 缺少 {len(missing_keys)} 个当前模型参数，使用新初始化值")
+    return bool(dropped_keys or missing_keys)
+
+
+def _extract_model_state(payload: dict) -> dict:
+    """兼容单脑模型、完整策略模型以及完整 checkpoint。"""
+
+    for key in ("brain_state_dict", "policy_state_dict", "model_state_dict", "state_dict"):
+        state = payload.get(key) if isinstance(payload, dict) else None
+        if isinstance(state, dict):
+            return state
+    return payload
+
+
+def _load_initial_model(policy: torch.nn.Module, path: Path, device: torch.device) -> None:
+    """将一个单个体模型复制到所有独立大脑，或载入完整策略模型。"""
+
+    payload = torch.load(path, map_location=device)
+    state = _extract_model_state(payload)
+    if not isinstance(state, dict):
+        raise ValueError(f"初始模型格式不受支持: {path}")
+
+    is_independent = getattr(policy, "cnn_independent", False)
+    is_full_independent_state = any(str(key).startswith("brains.") for key in state)
+    if is_independent and not is_full_independent_state:
+        skipped = False
+        for brain in policy.brains:
+            skipped = _load_state_dict_lenient(brain, state) or skipped
+        if skipped:
+            print("[警告] 初始单脑模型有部分参数尺寸不匹配，已跳过")
+        print(f"已将初始单脑模型复制到 {policy.brain_count} 个个体: {path}")
+        return
+
+    _load_state_dict_lenient(policy, state)
+    print(f"已加载完整初始模型: {path}")
+
+
+def _select_last_survivor(env: ProtoLifeEnv) -> dict | None:
+    """选择当前仍存活且生命状态最高的个体，供灭绝时保存。"""
+
+    energy = env.agent_batch.state["energy"]
+    health = env.agent_batch.state["health"]
+    alive = energy > 0
+    if env.use_health:
+        alive = alive & (health > 0)
+    if not alive.any():
+        return None
+
+    score = energy / max(env.energy_max, 1e-6)
+    if env.use_health:
+        score = score + health / max(env.health_max, 1e-6)
+    score = torch.where(alive, score, torch.full_like(score, float("-inf")))
+    flat_index = int(score.reshape(-1).argmax().item())
+    agent_count = env.agent_batch.agents_per_env
+    env_idx, agent_idx = divmod(flat_index, agent_count)
+    return {
+        "env_idx": env_idx,
+        "agent_idx": agent_idx,
+        "energy": float(energy[env_idx, agent_idx].item()),
+        "health": float(health[env_idx, agent_idx].item()),
+    }
+
+
+def _save_last_survivor_model(
+    policy: torch.nn.Module,
+    checkpoint_dir: Path,
+    survivor: dict,
+    step: int,
+) -> Path:
+    """保存灭绝前最后存活个体的完整独立大脑。"""
+
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    destination = checkpoint_dir / "last_survivor.pth"
+    payload = {
+        "step": int(step),
+        "env_idx": survivor["env_idx"],
+        "agent_idx": survivor["agent_idx"],
+        "energy_before_final_step": survivor["energy"],
+        "health_before_final_step": survivor["health"],
+    }
+    if getattr(policy, "cnn_independent", False):
+        brain_index = survivor["env_idx"] * policy.agents_per_env + survivor["agent_idx"]
+        payload["brain_state_dict"] = policy.brains[brain_index].state_dict()
+    else:
+        payload["policy_state_dict"] = policy.state_dict()
+    torch.save(payload, destination)
+    return destination
 
 
 def get_cfg(config: dict, default_config: dict, section: str, key: str, fallback):
@@ -79,7 +169,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-dir", type=str, default=None, help="模型目录，支持指向已有模型继续训练")
     parser.add_argument("--model-name", type=str, default=None, help="模型名称，若缺省则交互式输入")
     parser.add_argument("--resume-from", type=str, default=None, help="从完整 checkpoint 继续推演")
-    parser.add_argument("--load-model", type=str, default=None, help="仅加载模型权重")
+    parser.add_argument(
+        "--fresh", action="store_true", help="忽略已有 checkpoint，从初始模型或随机参数开始"
+    )
+    parser.add_argument(
+        "--load-model",
+        type=str,
+        default=None,
+        help="无 checkpoint 时使用的初始模型；单脑模型会复制给所有个体",
+    )
     parser.add_argument("--print-interval", type=int, default=None, help="训练日志打印间隔")
     return parser.parse_args()
 
@@ -170,15 +268,27 @@ def main() -> None:
     resolved_seed = _resolve_random_seed(config, default_config)
     merged_config = _merge_dict(default_config, config)
     merged_config.setdefault("world", {})["random_seed"] = resolved_seed
-    model_config_path.write_text(yaml.safe_dump(merged_config, allow_unicode=True), encoding="utf-8")
+    save_config_with_comments(model_config_path, merged_config)
     print(f"模型目录: {model_dir.resolve()}")
     print(f"配置文件: {config_path.resolve()}")
     print(f"Checkpoint 目录: {checkpoint_dir.resolve()}")
     set_seed(resolved_seed)
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
 
     env = ProtoLifeEnv(config, default_config)
     policy = build_policy(config, default_config, obs_dim=env.observation_dim, patch_shape=env.patch_shape).to(env.device)
-    optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
+    try:
+        optimizer = torch.optim.Adam(
+            policy.parameters(), lr=1e-3, fused=env.device.type == "cuda"
+        )
+    except TypeError:
+        optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
+    if getattr(policy, "cnn_independent", False):
+        print(f"已启用 {policy.brain_count} 个完全独立的 CNN 个体大脑")
 
     logger = None
     if get_cfg(config, default_config, "logging", "save_dir", True):
@@ -196,10 +306,13 @@ def main() -> None:
                 "agent_marker_size": env.agent_marker_size,
                 "num_envs": env.agent_batch.num_envs,
                 "agents_per_env": env.agent_batch.agents_per_env,
+                "initial_agents_per_env": env.initial_agents_per_env,
+                "max_agents_per_env": env.max_agents_per_env,
                 "run_name": model_dir.name,
                 "run_tag": run_tag,
                 "map_file": env.map_file,
                 "toxin_lifetime": getattr(env, "toxin_lifetime", None),
+                "use_health": env.use_health,
             },
             buffer_on_gpu=get_cfg(
                 config, default_config, "logging", "snapshot_gpu_stage", False
@@ -213,6 +326,9 @@ def main() -> None:
     save_interval = args.save_interval or get_cfg(config, default_config, "training", "save_interval", 100)
     print_actions = get_cfg(config, default_config, "training", "print_actions", False)
     entropy_coef = get_cfg(config, default_config, "training", "entropy_coef", 0.01)
+    policy_mutation_std = float(
+        get_cfg(config, default_config, "reproduction", "policy_mutation_std", 0.01)
+    )
     print_interval = args.print_interval or get_cfg(
         config, default_config, "training", "print_interval", TRAIN_DEFAULTS["training"]["print_interval"]
     )
@@ -227,11 +343,13 @@ def main() -> None:
     epsilon_greedy = float(action_noise_cfg.get("epsilon", 0.0) or 0.0)
 
     start_step = 0
-    latest_checkpoint = _find_latest_full_checkpoint(checkpoint_dir)
-    if args.resume_from:
-        checkpoint_path = Path(args.resume_from)
-    else:
-        checkpoint_path = latest_checkpoint
+    auto_resume = bool(get_cfg(config, default_config, "training", "auto_resume", True))
+    latest_checkpoint = (
+        _find_latest_full_checkpoint(checkpoint_dir)
+        if auto_resume and not args.fresh
+        else None
+    )
+    checkpoint_path = Path(args.resume_from) if args.resume_from else latest_checkpoint
 
     if checkpoint_path:
         print(f"使用的 checkpoint: {checkpoint_path.resolve()}")
@@ -241,21 +359,44 @@ def main() -> None:
         if optim_state and not skipped:
             optimizer.load_state_dict(optim_state)
         start_step = int(meta.get("step", 0))
+        env.step_count = start_step
         obs = env._build_observations()
         print(f"从 checkpoint 恢复，起始 step={start_step}，来源: {checkpoint_path}")
     else:
-        print("未找到现有 checkpoint，将从头开始训练。")
+        print("未恢复 checkpoint，将开始新的训练。")
         obs = env.reset()
-        if args.load_model:
-            state = torch.load(args.load_model, map_location=env.device)
-            _load_state_dict_lenient(policy, state)
-            print(f"仅加载模型参数：{args.load_model}")
+        initial_model = args.load_model or get_cfg(
+            config, default_config, "training", "initial_model", None
+        )
+        if initial_model:
+            initial_model_path = Path(str(initial_model))
+            if not initial_model_path.exists():
+                model_relative_path = model_dir / initial_model_path
+                if model_relative_path.exists():
+                    initial_model_path = model_relative_path
+                else:
+                    raise FileNotFoundError(f"找不到初始模型: {initial_model}")
+            _load_initial_model(policy, initial_model_path, env.device)
+
+    if logger:
+        logger.metadata["start_step"] = start_step
+        logger.metadata["resumed_from_step"] = start_step
+        logger.metadata["checkpoint_path"] = str(checkpoint_path) if checkpoint_path else None
+        logger.step_counter = start_step
+        logger._write_header()
 
     total_steps = start_step
     rollout_steps = get_cfg(config, default_config, "training", "rollout_steps", 128)
     last_print_time = time.perf_counter()
     last_print_step = total_steps
+    final_reward_mean = None
     for step in range(rollout_steps):
+        alive_for_loss = obs["alive"].reshape(-1)
+        last_survivor = _select_last_survivor(env)
+        if last_survivor is None and env.use_death:
+            print("所有个体在本轮开始前已经死亡，训练停止。")
+            break
+
         if getattr(policy, "use_cnn", False):
             patches = obs["patch"]
             memory_state = env.agent_batch.state.get("memory")
@@ -264,12 +405,16 @@ def main() -> None:
                 hidden = (memory_state, memory_cell) if memory_state is not None else None
             else:
                 hidden = memory_state
-            logits, values, new_hidden = policy(patches, hidden)
+            logits, values, new_hidden = policy(
+                patches, hidden, obs["agent_features"]
+            )
             if isinstance(new_hidden, tuple):
-                env.agent_batch.state["memory"] = new_hidden[0].detach()
-                env.agent_batch.state["memory_cell"] = new_hidden[1].detach()
+                # clone 解除与当前计算图的共享存储，环境可安全重置新生槽位记忆。
+                env.agent_batch.state["memory"] = new_hidden[0].detach().clone()
+                env.agent_batch.state["memory_cell"] = new_hidden[1].detach().clone()
             else:
-                env.agent_batch.state["memory"] = new_hidden.detach()
+                # detach 不复制存储；繁殖时的 zero_ 会破坏反向图，因此必须 clone。
+                env.agent_batch.state["memory"] = new_hidden.detach().clone()
         else:
             flat_obs = obs["agent_obs"]
             logits, values = policy(flat_obs)
@@ -288,24 +433,41 @@ def main() -> None:
             actions = torch.where(greedy_mask, random_actions, actions)
 
         if print_actions:
-            action_ids = actions.cpu().tolist()
+            action_ids = actions.reshape(-1).cpu().tolist()
             names = [action_space.get(int(a), str(int(a))) for a in action_ids]
             print(f"[step={total_steps}] actions: {action_ids} -> {names}")
 
         step_result = env.step(actions)
         rewards = step_result.rewards
+        final_reward_mean = rewards.mean().item()
 
-        log_probs = dist.log_prob(actions).view(-1)
-        entropy = dist.entropy().mean()
-        predicted_values = values.view(-1)
-        policy_loss = -(rewards.detach() * log_probs).mean()
-        value_loss = 0.5 * ((predicted_values - rewards.detach()) ** 2).mean()
+        log_probs = dist.log_prob(actions).view(-1)[alive_for_loss]
+        predicted_values = values.view(-1)[alive_for_loss]
+        active_rewards = rewards.detach()[alive_for_loss]
+        active_entropy = dist.entropy().view(-1)[alive_for_loss]
+        if getattr(policy, "cnn_independent", False):
+            # 每套大脑只产生一个样本，使用求和避免梯度被个体数量额外缩小。
+            policy_loss = -(active_rewards * log_probs).sum()
+            value_loss = 0.5 * ((predicted_values - active_rewards) ** 2).sum()
+            entropy = active_entropy.sum()
+        else:
+            policy_loss = -(active_rewards * log_probs).mean()
+            value_loss = 0.5 * ((predicted_values - active_rewards) ** 2).mean()
+            entropy = active_entropy.mean()
         entropy_loss = -entropy_coef * entropy
         loss = policy_loss + value_loss + entropy_loss
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
+
+        if step_result.reproduction_events and hasattr(policy, "inherit_policy_head"):
+            for env_idx, parent_idx, child_idx in step_result.reproduction_events:
+                inherited_parameters = policy.inherit_policy_head(
+                    env_idx, parent_idx, child_idx, policy_mutation_std
+                )
+                for parameter in inherited_parameters:
+                    optimizer.state.pop(parameter, None)
 
         obs = step_result.observations
         total_steps += 1
@@ -334,7 +496,17 @@ def main() -> None:
             last_print_step = total_steps
 
         if logger:
-            logger.maybe_log(env.map_state, env.agent_batch.export_state())
+            logger.maybe_log(
+                env.map_state, env.agent_batch.export_state(), step=total_steps
+            )
+
+        all_dead = env.use_death and bool(step_result.dones.all().item())
+        if all_dead:
+            survivor_path = _save_last_survivor_model(
+                policy, checkpoint_dir, last_survivor, total_steps
+            )
+            print(f"所有个体已死亡，训练停止；最后存活个体模型已保存至: {survivor_path}")
+            break
 
         if total_steps % save_interval == 0:
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -352,7 +524,8 @@ def main() -> None:
     if logger:
         logger.flush()
 
-    print("训练完成，最终奖励均值:", step_result.rewards.mean().item())
+    if final_reward_mean is not None:
+        print("训练完成，最终奖励均值:", final_reward_mean)
 
 
 if __name__ == "__main__":

@@ -14,6 +14,9 @@ import torch
 import matplotlib.pyplot as plt
 from matplotlib.path import Path as MplPath
 
+plt.rcParams["font.sans-serif"] = ["Microsoft YaHei"]
+plt.rcParams["axes.unicode_minus"] = False
+
 # 确保可以从仓库根目录导入 protolife 包
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
