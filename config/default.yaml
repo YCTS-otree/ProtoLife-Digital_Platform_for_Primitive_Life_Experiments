@@ -65,10 +65,15 @@ reproduction:
 # 训练超参与调试开关
 training:
   num_envs: 1  # 并行环境数量
-  rollout_steps: 65536  # 单次收集的步数
-  gamma: 0.99  # 折扣因子
-  gae_lambda: 0.95  # GAE 参数
-  ppo_clip: 0.2  # PPO clip 系数（预留）
+  rollout_steps: 65536  # 本次运行的环境总步数
+  n_steps: 128  # 每次更新收集的最大连续步数，也是 GAE bootstrap 窗口
+  gamma: 0.99  # 多步回报折扣因子
+  gae_lambda: 0.95  # GAE 偏差/方差权衡参数
+  ppo_clip: 0.2  # PPO 策略比率与价值函数裁剪范围
+  ppo_epochs: 4  # 每批 n-step 轨迹重复优化次数
+  ppo_minibatch_steps: 4  # 连续时间小批长度，同时也是 TBPTT 反向传播长度；显存充足可调大
+  value_coef: 0.5  # 价值损失权重
+  normalize_advantages: true  # 仅对有效生命样本归一化 advantage
   entropy_coef: 0.01  # 策略熵权重，防止动作过早塌缩，设置为 0 可关闭
   learning_rate: 0.0001  # Adam 学习率；在线单步更新建议从 1e-4 起步
   max_grad_norm: 1.0  # 梯度范数裁剪；设为 0 可关闭

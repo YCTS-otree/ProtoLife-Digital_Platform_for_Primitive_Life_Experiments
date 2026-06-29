@@ -28,6 +28,14 @@ TRAIN_DEFAULTS = {
         "initial_model": None,
         "auto_resume": True,
         "rollout_steps": 128,
+        "n_steps": 128,
+        "gamma": 0.99,
+        "gae_lambda": 0.95,
+        "ppo_clip": 0.2,
+        "ppo_epochs": 4,
+        "ppo_minibatch_steps": 4,
+        "value_coef": 0.5,
+        "normalize_advantages": True,
         "save_interval": 100,
         "entropy_coef": 0.01,
         "learning_rate": 1e-4,
@@ -248,6 +256,314 @@ def _find_latest_full_checkpoint(checkpoint_dir: Path) -> Path | None:
     return candidates[0] if candidates else None
 
 
+def _clone_hidden(hidden):
+    if isinstance(hidden, tuple):
+        return tuple(item.detach().clone() for item in hidden)
+    if hidden is None:
+        return None
+    return hidden.detach().clone()
+
+
+def _current_hidden(env: ProtoLifeEnv):
+    memory = env.agent_batch.state.get("memory")
+    if memory is None:
+        return None
+    if env.agent_batch.use_lstm:
+        return memory, env.agent_batch.state["memory_cell"]
+    return memory
+
+
+def _forward_policy_inputs(
+    policy: torch.nn.Module,
+    patch: torch.Tensor | None,
+    agent_features: torch.Tensor | None,
+    agent_obs: torch.Tensor | None,
+    hidden,
+):
+    if getattr(policy, "use_cnn", False):
+        return policy(patch, hidden, agent_features)
+    logits, values = policy(agent_obs)
+    return logits, values, None
+
+
+def _reshape_policy_outputs(
+    logits: torch.Tensor, values: torch.Tensor, population_shape: torch.Size
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        logits.reshape(*population_shape, -1),
+        values.reshape(*population_shape),
+    )
+
+
+def _behavior_log_prob_and_entropy(
+    logits: torch.Tensor, actions: torch.Tensor, epsilon: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    log_probs = torch.log_softmax(logits, dim=-1)
+    probabilities = torch.softmax(logits, dim=-1)
+    if epsilon > 0:
+        probabilities = (1.0 - epsilon) * probabilities + epsilon / logits.size(-1)
+        log_probs = torch.log(probabilities.clamp_min(1e-8))
+    selected = log_probs.gather(-1, actions.unsqueeze(-1)).squeeze(-1)
+    entropy = -(probabilities * log_probs).sum(dim=-1)
+    return selected, entropy
+
+
+def _mask_hidden(hidden, continuation: torch.Tensor):
+    if hidden is None:
+        return None
+    mask = continuation.unsqueeze(-1)
+    if isinstance(hidden, tuple):
+        return tuple(item * mask.to(dtype=item.dtype) for item in hidden)
+    return hidden * mask.to(dtype=hidden.dtype)
+
+
+def _transition_continuation(
+    valid: torch.Tensor,
+    next_alive: torch.Tensor,
+    dones: torch.Tensor,
+    reproduction_events: list[tuple[int, int, int]],
+) -> torch.Tensor:
+    """切断死亡以及新生命复用旧槽位处的回报和隐藏状态。"""
+
+    born_mask = torch.zeros_like(valid)
+    for env_idx, _, child_idx in reproduction_events:
+        born_mask[env_idx, child_idx] = True
+    return valid & next_alive & ~dones.reshape(valid.shape) & ~born_mask
+
+
+def _compute_gae(
+    rewards: torch.Tensor,
+    values: torch.Tensor,
+    continuation: torch.Tensor,
+    bootstrap_values: torch.Tensor,
+    gamma: float,
+    gae_lambda: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """计算截断 n-step rollout 上的 GAE 与 bootstrap return。"""
+
+    advantages = torch.zeros_like(rewards)
+    next_advantage = torch.zeros_like(bootstrap_values)
+    next_values = bootstrap_values
+    for index in range(rewards.size(0) - 1, -1, -1):
+        can_continue = continuation[index].to(dtype=rewards.dtype)
+        delta = rewards[index] + gamma * next_values * can_continue - values[index]
+        next_advantage = delta + gamma * gae_lambda * can_continue * next_advantage
+        advantages[index] = next_advantage
+        next_values = values[index]
+    returns = advantages + values
+    return advantages, returns
+
+
+def _normalize_valid_advantages(
+    advantages: torch.Tensor, valid: torch.Tensor, independent: bool
+) -> torch.Tensor:
+    normalized = torch.zeros_like(advantages)
+    if independent:
+        flat_advantages = advantages.reshape(advantages.size(0), -1)
+        flat_valid = valid.reshape(valid.size(0), -1)
+        flat_normalized = normalized.reshape(normalized.size(0), -1)
+        for brain_index in range(flat_advantages.size(1)):
+            brain_mask = flat_valid[:, brain_index]
+            brain_values = flat_advantages[:, brain_index][brain_mask]
+            if brain_values.numel() == 0:
+                continue
+            if brain_values.numel() > 1:
+                brain_values = (
+                    (brain_values - brain_values.mean())
+                    / (brain_values.std(unbiased=False) + 1e-8)
+                )
+            flat_normalized[brain_mask, brain_index] = brain_values
+        return normalized
+
+    valid_values = advantages[valid]
+    if valid_values.numel() == 0:
+        return normalized
+    if valid_values.numel() > 1:
+        valid_values = (valid_values - valid_values.mean()) / (
+            valid_values.std(unbiased=False) + 1e-8
+        )
+    normalized[valid] = valid_values
+    return normalized
+
+
+def _ppo_clipped_surrogate(
+    ratio: torch.Tensor, advantages: torch.Tensor, clip_range: float
+) -> torch.Tensor:
+    unclipped = ratio * advantages
+    clipped = torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range) * advantages
+    return torch.minimum(unclipped, clipped)
+
+
+def _masked_reduce(
+    values: torch.Tensor, valid: torch.Tensor, independent: bool
+) -> torch.Tensor:
+    if independent:
+        flat_values = values.reshape(values.size(0), -1)
+        flat_valid = valid.reshape(valid.size(0), -1)
+        sample_counts = flat_valid.sum(dim=0)
+        active_brains = sample_counts > 0
+        per_brain = (flat_values * flat_valid.to(values.dtype)).sum(dim=0)
+        per_brain = per_brain / sample_counts.clamp_min(1).to(values.dtype)
+        return per_brain[active_brains].sum()
+    return values[valid].mean()
+
+
+def _clear_inactive_brain_gradients(
+    policy: torch.nn.Module, valid: torch.Tensor
+) -> None:
+    if not getattr(policy, "cnn_independent", False):
+        return
+    active_brains = valid.any(dim=0).reshape(-1)
+    for brain_index, is_active in enumerate(active_brains.tolist()):
+        if is_active:
+            continue
+        for parameter in policy.brains[brain_index].parameters():
+            parameter.grad = None
+
+
+def _ppo_update(
+    policy: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    rollout: list[dict],
+    advantages: torch.Tensor,
+    returns: torch.Tensor,
+    *,
+    clip_range: float,
+    ppo_epochs: int,
+    minibatch_steps: int,
+    value_coef: float,
+    entropy_coef: float,
+    max_grad_norm: float,
+    epsilon_greedy: float,
+) -> dict[str, float]:
+    independent = bool(getattr(policy, "cnn_independent", False))
+    metric_sums = {
+        "policy_loss": 0.0,
+        "value_loss": 0.0,
+        "entropy": 0.0,
+        "approx_kl": 0.0,
+        "clip_fraction": 0.0,
+    }
+    update_count = 0
+    chunk_starts = list(range(0, len(rollout), minibatch_steps))
+
+    for _ in range(ppo_epochs):
+        chunk_order = torch.randperm(len(chunk_starts)).tolist()
+        for chunk_position in chunk_order:
+            start = chunk_starts[chunk_position]
+            end = min(start + minibatch_steps, len(rollout))
+            hidden = _clone_hidden(rollout[start]["hidden"])
+            new_log_probs = []
+            new_values = []
+            entropies = []
+
+            for time_index in range(start, end):
+                sample = rollout[time_index]
+                logits, values, new_hidden = _forward_policy_inputs(
+                    policy,
+                    sample["patch"],
+                    sample["agent_features"],
+                    sample["agent_obs"],
+                    hidden,
+                )
+                logits, values = _reshape_policy_outputs(
+                    logits, values, sample["actions"].shape
+                )
+                behavior_logits = logits + sample["logit_noise"]
+                log_probs, entropy = _behavior_log_prob_and_entropy(
+                    behavior_logits, sample["actions"], epsilon_greedy
+                )
+                new_log_probs.append(log_probs)
+                new_values.append(values)
+                entropies.append(entropy)
+                hidden = _mask_hidden(new_hidden, sample["continuation"])
+
+            new_log_probs = torch.stack(new_log_probs)
+            new_values = torch.stack(new_values)
+            entropies = torch.stack(entropies)
+            old_log_probs = torch.stack(
+                [rollout[index]["old_log_probs"] for index in range(start, end)]
+            )
+            old_values = torch.stack(
+                [rollout[index]["old_values"] for index in range(start, end)]
+            )
+            valid = torch.stack(
+                [rollout[index]["valid"] for index in range(start, end)]
+            )
+            if not bool(valid.any().item()):
+                continue
+            chunk_advantages = advantages[start:end]
+            chunk_returns = returns[start:end]
+
+            log_ratio = new_log_probs - old_log_probs
+            ratio = torch.exp(log_ratio)
+            surrogate = _ppo_clipped_surrogate(ratio, chunk_advantages, clip_range)
+            policy_loss = -_masked_reduce(surrogate, valid, independent)
+
+            clipped_values = old_values + torch.clamp(
+                new_values - old_values, -clip_range, clip_range
+            )
+            value_error = (new_values - chunk_returns).square()
+            clipped_value_error = (clipped_values - chunk_returns).square()
+            value_loss = 0.5 * _masked_reduce(
+                torch.maximum(value_error, clipped_value_error), valid, independent
+            )
+            entropy = _masked_reduce(entropies, valid, independent)
+            loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            _clear_inactive_brain_gradients(policy, valid)
+            if max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
+            optimizer.step()
+
+            with torch.no_grad():
+                valid_log_ratio = log_ratio[valid]
+                metric_sums["policy_loss"] += float(policy_loss.item())
+                metric_sums["value_loss"] += float(value_loss.item())
+                metric_sums["entropy"] += float(entropy.item())
+                metric_sums["approx_kl"] += float((-valid_log_ratio).mean().item())
+                metric_sums["clip_fraction"] += float(
+                    ((ratio[valid] - 1.0).abs() > clip_range).float().mean().item()
+                )
+            update_count += 1
+
+    if update_count == 0:
+        return metric_sums
+    return {key: value / update_count for key, value in metric_sums.items()}
+
+
+def _save_ppo_checkpoint(
+    policy: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    env: ProtoLifeEnv,
+    checkpoint_dir: Path,
+    step: int,
+    *,
+    n_steps: int,
+    gamma: float,
+    gae_lambda: float,
+    ppo_clip: float,
+) -> None:
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(policy.state_dict(), checkpoint_dir / f"model_step_{step}.pth")
+    torch.save(optimizer.state_dict(), checkpoint_dir / f"optim_step_{step}.pth")
+    save_checkpoint(
+        checkpoint_dir / f"full_step_{step}.pt",
+        env_state=env.export_state(),
+        policy_state_dict=policy.state_dict(),
+        optimizer_state_dict=optimizer.state_dict(),
+        meta={
+            "step": step,
+            "algorithm": "ppo_gae_n_step",
+            "n_steps": n_steps,
+            "gamma": gamma,
+            "gae_lambda": gae_lambda,
+            "ppo_clip": ppo_clip,
+        },
+    )
+
 def main() -> None:
     args = parse_args()
     run_tag = time.strftime("%Y%m%d_%H%M%S")
@@ -333,9 +649,52 @@ def main() -> None:
         )
 
     checkpoint_dir = Path(checkpoint_dir)
-    save_interval = args.save_interval or get_cfg(config, default_config, "training", "save_interval", 100)
-    print_actions = get_cfg(config, default_config, "training", "print_actions", False)
-    entropy_coef = get_cfg(config, default_config, "training", "entropy_coef", 0.01)
+    save_interval = int(
+        args.save_interval
+        or get_cfg(config, default_config, "training", "save_interval", 100)
+    )
+    print_actions = bool(get_cfg(config, default_config, "training", "print_actions", False))
+    entropy_coef = float(
+        get_cfg(config, default_config, "training", "entropy_coef", 0.01)
+    )
+    n_steps = int(
+        get_cfg(config, default_config, "training", "n_steps", TRAIN_DEFAULTS["training"]["n_steps"])
+    )
+    gamma = float(
+        get_cfg(config, default_config, "training", "gamma", TRAIN_DEFAULTS["training"]["gamma"])
+    )
+    gae_lambda = float(
+        get_cfg(
+            config, default_config, "training", "gae_lambda", TRAIN_DEFAULTS["training"]["gae_lambda"]
+        )
+    )
+    ppo_clip = float(
+        get_cfg(config, default_config, "training", "ppo_clip", TRAIN_DEFAULTS["training"]["ppo_clip"])
+    )
+    ppo_epochs = int(
+        get_cfg(config, default_config, "training", "ppo_epochs", TRAIN_DEFAULTS["training"]["ppo_epochs"])
+    )
+    ppo_minibatch_steps = int(
+        get_cfg(
+            config,
+            default_config,
+            "training",
+            "ppo_minibatch_steps",
+            TRAIN_DEFAULTS["training"]["ppo_minibatch_steps"],
+        )
+    )
+    value_coef = float(
+        get_cfg(config, default_config, "training", "value_coef", TRAIN_DEFAULTS["training"]["value_coef"])
+    )
+    normalize_advantages = bool(
+        get_cfg(
+            config,
+            default_config,
+            "training",
+            "normalize_advantages",
+            TRAIN_DEFAULTS["training"]["normalize_advantages"],
+        )
+    )
     policy_mutation_std = float(
         get_cfg(config, default_config, "reproduction", "policy_mutation_std", 0.01)
     )
@@ -352,6 +711,36 @@ def main() -> None:
     gaussian_noise_std = float(action_noise_cfg.get("gaussian_std", 0.0) or 0.0)
     epsilon_greedy = float(action_noise_cfg.get("epsilon", 0.0) or 0.0)
 
+    if save_interval <= 0:
+        raise ValueError("training.save_interval 必须大于 0")
+    if n_steps <= 0:
+        raise ValueError("training.n_steps 必须大于 0")
+    if not 0 < gamma <= 1:
+        raise ValueError("training.gamma 必须在 (0, 1] 范围内")
+    if not 0 <= gae_lambda <= 1:
+        raise ValueError("training.gae_lambda 必须在 [0, 1] 范围内")
+    if not 0 < ppo_clip < 1:
+        raise ValueError("training.ppo_clip 必须在 (0, 1) 范围内")
+    if ppo_epochs <= 0 or ppo_minibatch_steps <= 0:
+        raise ValueError("ppo_epochs 和 ppo_minibatch_steps 必须大于 0")
+    if value_coef < 0 or entropy_coef < 0:
+        raise ValueError("value_coef 和 entropy_coef 不能为负数")
+    if gaussian_noise_std < 0 or not 0 <= epsilon_greedy <= 1:
+        raise ValueError("action_noise 参数超出有效范围")
+
+    if logger:
+        logger.metadata.update(
+            {
+                "algorithm": "ppo_gae_n_step",
+                "n_steps": n_steps,
+                "gamma": gamma,
+                "gae_lambda": gae_lambda,
+                "ppo_clip": ppo_clip,
+                "ppo_epochs": ppo_epochs,
+                "ppo_minibatch_steps": ppo_minibatch_steps,
+            }
+        )
+
     start_step = 0
     auto_resume = bool(get_cfg(config, default_config, "training", "auto_resume", True))
     latest_checkpoint = (
@@ -366,11 +755,14 @@ def main() -> None:
         env_state, policy_state, optim_state, meta = load_checkpoint(checkpoint_path, map_location=env.device)
         env.load_state(env_state)
         skipped = _load_state_dict_lenient(policy, policy_state)
-        if optim_state and not skipped:
+        checkpoint_algorithm = meta.get("algorithm")
+        if optim_state and not skipped and checkpoint_algorithm == "ppo_gae_n_step":
             optimizer.load_state_dict(optim_state)
             # optimizer checkpoint 会保存旧学习率；续训时以当前 YAML 配置为准。
             for parameter_group in optimizer.param_groups:
                 parameter_group["lr"] = learning_rate
+        elif optim_state and checkpoint_algorithm != "ppo_gae_n_step":
+            print("检测到旧版单步训练 checkpoint，将保留模型/环境并重置 Adam 状态。")
         start_step = int(meta.get("step", 0))
         env.step_count = start_step
         obs = env._build_observations()
@@ -399,142 +791,279 @@ def main() -> None:
         logger._write_header()
 
     total_steps = start_step
-    rollout_steps = get_cfg(config, default_config, "training", "rollout_steps", 128)
+    run_steps = 0
+    rollout_steps = int(
+        get_cfg(config, default_config, "training", "rollout_steps", 128)
+    )
+    next_checkpoint_step = (total_steps // save_interval + 1) * save_interval
+    last_checkpoint_step = start_step if checkpoint_path else None
     last_print_time = time.perf_counter()
     last_print_step = total_steps
     final_reward_mean = None
-    for step in range(rollout_steps):
-        alive_for_loss = obs["alive"].reshape(-1)
-        last_survivor = _select_last_survivor(env)
-        if last_survivor is None and env.use_death:
-            print("所有个体在本轮开始前已经死亡，训练停止。")
-            break
+    stop_training = False
 
-        if getattr(policy, "use_cnn", False):
-            patches = obs["patch"]
-            memory_state = env.agent_batch.state.get("memory")
-            if env.agent_batch.use_lstm:
-                memory_cell = env.agent_batch.state.get("memory_cell")
-                hidden = (memory_state, memory_cell) if memory_state is not None else None
-            else:
-                hidden = memory_state
-            logits, values, new_hidden = policy(
-                patches, hidden, obs["agent_features"]
+    while run_steps < rollout_steps and not stop_training:
+        rollout: list[dict] = []
+        pending_reproduction_events: list[tuple[int, int, int]] = []
+        final_survivor = None
+        all_dead = False
+        rollout_limit = min(
+            n_steps,
+            rollout_steps - run_steps,
+            next_checkpoint_step - total_steps,
+        )
+
+        for _ in range(rollout_limit):
+            valid = obs["alive"].detach().clone()
+            last_survivor = _select_last_survivor(env)
+            if last_survivor is None and env.use_death:
+                print("所有个体在本轮开始前已经死亡，训练停止。")
+                stop_training = True
+                break
+
+            hidden = _clone_hidden(_current_hidden(env))
+            patch = (
+                obs["patch"].detach().clone()
+                if getattr(policy, "use_cnn", False)
+                else None
             )
+            agent_features = (
+                obs["agent_features"].detach().clone()
+                if getattr(policy, "use_cnn", False)
+                else None
+            )
+            agent_obs = (
+                None
+                if getattr(policy, "use_cnn", False)
+                else obs["agent_obs"].detach().clone()
+            )
+
+            with torch.no_grad():
+                logits, values, new_hidden = _forward_policy_inputs(
+                    policy, patch, agent_features, agent_obs, hidden
+                )
+                logits, values = _reshape_policy_outputs(
+                    logits, values, valid.shape
+                )
+                if gaussian_noise_std > 0:
+                    logit_noise = torch.randn_like(logits) * gaussian_noise_std
+                else:
+                    logit_noise = torch.zeros_like(logits)
+                behavior_logits = logits + logit_noise
+                actions = torch.distributions.Categorical(
+                    logits=behavior_logits
+                ).sample()
+                if epsilon_greedy > 0:
+                    random_actions = torch.randint(
+                        low=0,
+                        high=len(action_space),
+                        size=actions.shape,
+                        device=actions.device,
+                    )
+                    greedy_mask = (
+                        torch.rand(actions.shape, device=actions.device)
+                        < epsilon_greedy
+                    )
+                    actions = torch.where(greedy_mask, random_actions, actions)
+                old_log_probs, _ = _behavior_log_prob_and_entropy(
+                    behavior_logits, actions, epsilon_greedy
+                )
+
             if isinstance(new_hidden, tuple):
-                # clone 解除与当前计算图的共享存储，环境可安全重置新生槽位记忆。
                 env.agent_batch.state["memory"] = new_hidden[0].detach().clone()
                 env.agent_batch.state["memory_cell"] = new_hidden[1].detach().clone()
-            else:
-                # detach 不复制存储；繁殖时的 zero_ 会破坏反向图，因此必须 clone。
+            elif new_hidden is not None:
                 env.agent_batch.state["memory"] = new_hidden.detach().clone()
-        else:
-            flat_obs = obs["agent_obs"]
-            logits, values = policy(flat_obs)
 
-        if gaussian_noise_std > 0:
-            logits = logits + torch.randn_like(logits) * gaussian_noise_std
+            if print_actions:
+                action_ids = actions.reshape(-1).cpu().tolist()
+                names = [action_space.get(int(action), str(int(action))) for action in action_ids]
+                print(f"[step={total_steps}] actions: {action_ids} -> {names}")
 
-        dist = torch.distributions.Categorical(logits=logits)
-        actions = dist.sample()
-
-        if epsilon_greedy > 0:
-            random_actions = torch.randint(
-                low=0, high=len(action_space), size=actions.shape, device=actions.device
+            step_result = env.step(actions)
+            rewards = step_result.rewards.reshape(valid.shape).detach()
+            next_obs = step_result.observations
+            continuation = _transition_continuation(
+                valid,
+                next_obs["alive"].detach(),
+                step_result.dones,
+                step_result.reproduction_events,
             )
-            greedy_mask = torch.rand(actions.shape, device=actions.device, dtype=torch.float32) < epsilon_greedy
-            actions = torch.where(greedy_mask, random_actions, actions)
 
-        if print_actions:
-            action_ids = actions.reshape(-1).cpu().tolist()
-            names = [action_space.get(int(a), str(int(a))) for a in action_ids]
-            print(f"[step={total_steps}] actions: {action_ids} -> {names}")
+            rollout.append(
+                {
+                    "patch": patch,
+                    "agent_features": agent_features,
+                    "agent_obs": agent_obs,
+                    "hidden": hidden,
+                    "actions": actions.detach(),
+                    "old_log_probs": old_log_probs.detach(),
+                    "old_values": values.detach(),
+                    "rewards": rewards,
+                    "valid": valid,
+                    "continuation": continuation,
+                    "logit_noise": logit_noise.detach(),
+                }
+            )
 
-        step_result = env.step(actions)
-        rewards = step_result.rewards
-        final_reward_mean = rewards.mean().item()
+            final_reward_mean = float(rewards[valid].mean().item()) if valid.any() else 0.0
+            obs = next_obs
+            total_steps += 1
+            run_steps += 1
 
-        log_probs = dist.log_prob(actions).view(-1)[alive_for_loss]
-        predicted_values = values.view(-1)[alive_for_loss]
-        active_rewards = rewards.detach()[alive_for_loss]
-        active_entropy = dist.entropy().view(-1)[alive_for_loss]
-        if getattr(policy, "cnn_independent", False):
-            # 每套大脑只产生一个样本，使用求和避免梯度被个体数量额外缩小。
-            policy_loss = -(active_rewards * log_probs).sum()
-            value_loss = 0.5 * ((predicted_values - active_rewards) ** 2).sum()
-            entropy = active_entropy.sum()
-        else:
-            policy_loss = -(active_rewards * log_probs).mean()
-            value_loss = 0.5 * ((predicted_values - active_rewards) ** 2).mean()
-            entropy = active_entropy.mean()
-        entropy_loss = -entropy_coef * entropy
-        loss = policy_loss + value_loss + entropy_loss
+            if logger:
+                logger.maybe_log(
+                    env.map_state, env.agent_batch.export_state(), step=total_steps
+                )
 
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        if max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
-        optimizer.step()
+            all_dead = env.use_death and not bool(obs["alive"].any().item())
+            if all_dead:
+                final_survivor = last_survivor
+                stop_training = True
+                break
 
-        if step_result.reproduction_events and hasattr(policy, "inherit_policy_head"):
-            for env_idx, parent_idx, child_idx in step_result.reproduction_events:
+            if step_result.reproduction_events:
+                pending_reproduction_events.extend(step_result.reproduction_events)
+                # 继承会修改策略参数；先结算当前 rollout，保证 PPO behavior policy 固定。
+                break
+
+        if not rollout:
+            break
+
+        with torch.no_grad():
+            if all_dead:
+                bootstrap_values = torch.zeros_like(rollout[-1]["old_values"])
+            else:
+                bootstrap_hidden = _clone_hidden(_current_hidden(env))
+                bootstrap_logits, bootstrap_values, _ = _forward_policy_inputs(
+                    policy,
+                    obs["patch"] if getattr(policy, "use_cnn", False) else None,
+                    obs["agent_features"] if getattr(policy, "use_cnn", False) else None,
+                    None if getattr(policy, "use_cnn", False) else obs["agent_obs"],
+                    bootstrap_hidden,
+                )
+                _, bootstrap_values = _reshape_policy_outputs(
+                    bootstrap_logits, bootstrap_values, obs["alive"].shape
+                )
+
+        rollout_rewards = torch.stack([sample["rewards"] for sample in rollout])
+        rollout_values = torch.stack([sample["old_values"] for sample in rollout])
+        rollout_continuation = torch.stack(
+            [sample["continuation"] for sample in rollout]
+        )
+        rollout_valid = torch.stack([sample["valid"] for sample in rollout])
+        advantages, returns = _compute_gae(
+            rollout_rewards,
+            rollout_values,
+            rollout_continuation,
+            bootstrap_values.detach(),
+            gamma,
+            gae_lambda,
+        )
+        advantages = advantages.detach()
+        returns = returns.detach()
+        if normalize_advantages:
+            advantages = _normalize_valid_advantages(
+                advantages,
+                rollout_valid,
+                bool(getattr(policy, "cnn_independent", False)),
+            )
+
+        ppo_metrics = _ppo_update(
+            policy,
+            optimizer,
+            rollout,
+            advantages,
+            returns,
+            clip_range=ppo_clip,
+            ppo_epochs=ppo_epochs,
+            minibatch_steps=ppo_minibatch_steps,
+            value_coef=value_coef,
+            entropy_coef=entropy_coef,
+            max_grad_norm=max_grad_norm,
+            epsilon_greedy=epsilon_greedy,
+        )
+
+        if pending_reproduction_events and hasattr(policy, "inherit_policy_head"):
+            for env_idx, parent_idx, child_idx in pending_reproduction_events:
                 inherited_parameters = policy.inherit_policy_head(
                     env_idx, parent_idx, child_idx, policy_mutation_std
                 )
                 for parameter in inherited_parameters:
                     optimizer.state.pop(parameter, None)
 
-        obs = step_result.observations
-        total_steps += 1
-
-        if print_interval > 0 and total_steps % print_interval == 0:
+        if print_interval > 0 and (
+            total_steps - last_print_step >= print_interval or stop_training
+        ):
             now = time.perf_counter()
             step_delta = total_steps - last_print_step
             time_delta = now - last_print_time
             if time_delta > 0 and step_delta > 0:
                 steps_per_sec = step_delta / time_delta
-                if steps_per_sec >= 1:
-                    step_rate_text = f"{steps_per_sec:.2f} step/s"
-                else:
-                    step_rate_text = f"{(time_delta / step_delta):.2f} s/step"
-                agents_processed = step_delta * env.agent_batch.num_envs * env.agent_batch.agents_per_env
-                model_speed = agents_processed / time_delta
-                model_speed_text = f"{model_speed:.2f} agents/s"
+                step_rate_text = (
+                    f"{steps_per_sec:.2f} step/s"
+                    if steps_per_sec >= 1
+                    else f"{(time_delta / step_delta):.2f} s/step"
+                )
+                agents_processed = (
+                    step_delta
+                    * env.agent_batch.num_envs
+                    * env.agent_batch.agents_per_env
+                )
+                model_speed_text = f"{agents_processed / time_delta:.2f} agents/s"
             else:
                 step_rate_text = "n/a"
                 model_speed_text = "n/a"
-
             print(
-                f"steps:{total_steps}  rewards:{rewards}  step_rate:{step_rate_text}  model_speed:{model_speed_text}"
+                f"steps:{total_steps} reward_mean:{final_reward_mean:.6f} "
+                f"policy_loss:{ppo_metrics['policy_loss']:.6f} "
+                f"value_loss:{ppo_metrics['value_loss']:.6f} "
+                f"entropy:{ppo_metrics['entropy']:.6f} "
+                f"kl:{ppo_metrics['approx_kl']:.6f} "
+                f"clip_fraction:{ppo_metrics['clip_fraction']:.4f} "
+                f"step_rate:{step_rate_text} model_speed:{model_speed_text}"
             )
             last_print_time = now
             last_print_step = total_steps
 
-        if logger:
-            logger.maybe_log(
-                env.map_state, env.agent_batch.export_state(), step=total_steps
+        if total_steps >= next_checkpoint_step:
+            _save_ppo_checkpoint(
+                policy,
+                optimizer,
+                env,
+                checkpoint_dir,
+                total_steps,
+                n_steps=n_steps,
+                gamma=gamma,
+                gae_lambda=gae_lambda,
+                ppo_clip=ppo_clip,
             )
-
-        all_dead = env.use_death and bool(step_result.dones.all().item())
+            last_checkpoint_step = total_steps
+            print(f"已保存 checkpoint 至 {checkpoint_dir}, step={total_steps}")
+            while next_checkpoint_step <= total_steps:
+                next_checkpoint_step += save_interval
         if all_dead:
             survivor_path = _save_last_survivor_model(
-                policy, checkpoint_dir, last_survivor, total_steps
+                policy, checkpoint_dir, final_survivor, total_steps
             )
-            print(f"所有个体已死亡，训练停止；最后存活个体模型已保存至: {survivor_path}")
+            print(
+                f"所有个体已死亡，训练停止；最后存活个体模型已保存至: {survivor_path}"
+            )
             break
 
-        if total_steps % save_interval == 0:
-            checkpoint_dir.mkdir(parents=True, exist_ok=True)
-            torch.save(policy.state_dict(), checkpoint_dir / f"model_step_{total_steps}.pth")
-            torch.save(optimizer.state_dict(), checkpoint_dir / f"optim_step_{total_steps}.pth")
-            save_checkpoint(
-                checkpoint_dir / f"full_step_{total_steps}.pt",
-                env_state=env.export_state(),
-                policy_state_dict=policy.state_dict(),
-                optimizer_state_dict=optimizer.state_dict(),
-                meta={"step": total_steps},
-            )
-            print(f"已保存 checkpoint 至 {checkpoint_dir}, step={total_steps}")
+    if run_steps > 0 and last_checkpoint_step != total_steps:
+        _save_ppo_checkpoint(
+            policy,
+            optimizer,
+            env,
+            checkpoint_dir,
+            total_steps,
+            n_steps=n_steps,
+            gamma=gamma,
+            gae_lambda=gae_lambda,
+            ppo_clip=ppo_clip,
+        )
+        print(f"已保存最终 checkpoint 至 {checkpoint_dir}, step={total_steps}")
 
     if logger:
         logger.flush()

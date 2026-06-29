@@ -82,7 +82,10 @@ maps/
      - `rnn_hidden_dim` / `rnn_type`：启用 GRU（默认）或 LSTM 作为短期记忆，隐状态会作为 Agent 侧的 `memory` 保存到 checkpoint，旧存档缺失该字段时会自动补零。
      - `hidden`：当 `use_cnn` 关闭时回退的 MLP 隐藏层规模。
    - `training`：并行环境数、回合步数、保存间隔等训练相关参数（示例：`num_envs: 8`, `save_interval: 100`, `checkpoint_dir: checkpoints/phase0`）。
-     可用 `learning_rate` 调整 Adam 学习率（默认 `0.0001`），`max_grad_norm` 控制梯度范数裁剪（默认 `1.0`，设为 `0` 关闭）。`entropy_coef` 调整策略熵正则，`action_noise` 下的 `gaussian_std` 与 `epsilon` 分别控制 logits 高斯噪声和 epsilon-greedy 随机探索。
+     - `rollout_steps` 是本次运行的环境总步数；`n_steps` 是每次 PPO 更新最多收集的连续轨迹长度。
+     - `gamma` / `gae_lambda` 控制多步回报与 GAE；轨迹末端使用价值网络 bootstrap，死亡、出生和槽位复用会切断回报。
+     - `ppo_clip` 控制策略比率及价值裁剪，`ppo_epochs` 控制重复优化轮数，`ppo_minibatch_steps` 是连续时间小批长度及 TBPTT 长度。
+     - 可用 `learning_rate` 调整 Adam 学习率（默认 `0.0001`），`max_grad_norm` 控制梯度裁剪。`entropy_coef` 与 `action_noise` 控制探索。
      若需要调试模型的动作采样，可开启 `print_actions: true` 查看每步动作编号与含义。
    - `action_rewards`：行为基础奖励，可为正/负（示例：`MOVE: 0.01`, `ATTACK: -0.01`）。
    - `rewards`：生存/进食奖励与食物感知奖励开关。
@@ -104,7 +107,7 @@ maps/
 - 默认 `model.use_cnn: true`，环境会为每个体在 GPU 上一次性裁剪局部网格 patch，shape 为 `(num_envs, agents_per_env, C, H, W)`，其中 `C` 包含墙/可建造区/食物/毒素/资源/其他个体以及中心“自身”指示。
 - 策略网络改为 `CNNRecurrentPolicy`：卷积编码 -> GRU/LSTM 短期记忆 -> 动作 logits 与价值输出，兼容多环境、多智能体同时运行。
 - Agent 侧新增 `memory`（以及 LSTM 时的 `memory_cell`）字段，reset 时自动清零，checkpoint 会连同地图与优化器一起保存/恢复；旧存档缺少该字段时自动补零以避免维度错误。
-- 当前训练器会保留隐状态用于后续决策，但每一步更新后都会从计算图分离，因此目前是单步信用分配；增大 `rnn_hidden_dim` 只增加记忆容量，不能替代多步回报、GAE 或 TBPTT。
+- 训练器采用 n-step rollout + GAE + PPO；更新时按连续时间块重新展开 RNN，`ppo_minibatch_steps` 同时决定 TBPTT 长度。死亡、出生和槽位复用会清断对应隐状态，避免把不同生命的经验串在一起。
 - 若需要回退到旧的 MLP，占位策略，可在 YAML 中将 `model.use_cnn` 设为 `false`，其余训练入口与参数保持不变。
 
 4. **常见问题排查**

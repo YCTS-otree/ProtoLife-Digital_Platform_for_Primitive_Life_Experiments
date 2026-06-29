@@ -40,7 +40,7 @@ import matplotlib.pyplot as plt
 
 # ====== 常用可调参数 ======
 X_WINDOW_STEPS = 2048          # X 轴最多显示多少 step
-REFRESH_INTERVAL_SEC = 0.5     # 刷新间隔，单位：秒
+REFRESH_INTERVAL_SEC = 5     # 刷新间隔，单位：秒
 MIN_Y_MAX = 1                  # 防止 y 轴最大值为 0
 # ==========================
 
