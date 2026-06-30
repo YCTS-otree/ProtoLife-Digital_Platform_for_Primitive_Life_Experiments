@@ -7,18 +7,479 @@ from __future__ import annotations
 
 import argparse
 import copy
+from contextlib import contextmanager
+from datetime import datetime
+import json
+import os
 import re
+import secrets
+import sys
+import tempfile
 import time
+import traceback
 from pathlib import Path
 
 import torch
 import yaml
 
 from protolife.config_loader import load_config, save_config_with_comments
-from protolife.checkpoint import load_checkpoint, save_checkpoint
+from protolife.checkpoint import (
+    InsufficientCheckpointSpaceError,
+    find_latest_checkpoint,
+    load_checkpoint,
+    restore_rng_state,
+    save_split_checkpoint,
+    save_torch_payload,
+)
 from protolife.env import ProtoLifeEnv
 from protolife.policy import action_space, build_policy
 from protolife.utils.seed_utils import generate_seed, set_seed
+
+
+MIN_VALID_SIMULATION_STEPS = 1024
+SIMULATION_COUNT_PATH = Path("Simulation_counting.json")
+LEGACY_SIMULATION_COUNT_PATH = Path("Simulation_counting.txt")
+SIMULATION_COUNT_SCHEMA_VERSION = 2
+INVALID_ARTIFACT_MARKER = "无效_"
+_CONSOLE_CAPTURE = None
+_SIMULATION_CONTEXT: dict = {}
+_ACTIVE_PROFILER = None
+
+
+class _TeeStream:
+    def __init__(self, primary, log_file):
+        self.primary = primary
+        self.log_file = log_file
+
+    def write(self, text):
+        self.primary.write(text)
+        self.log_file.write(text)
+        return len(text)
+
+    def flush(self):
+        self.primary.flush()
+        self.log_file.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.primary, name)
+
+
+def _start_console_capture(path: Path) -> None:
+    global _CONSOLE_CAPTURE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    log_file = path.open("w", encoding="utf-8", buffering=1)
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    sys.stdout = _TeeStream(original_stdout, log_file)
+    sys.stderr = _TeeStream(original_stderr, log_file)
+    _CONSOLE_CAPTURE = (original_stdout, original_stderr, log_file)
+
+
+def _stop_console_capture() -> None:
+    global _CONSOLE_CAPTURE
+    if _CONSOLE_CAPTURE is None:
+        return
+    original_stdout, original_stderr, log_file = _CONSOLE_CAPTURE
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    finally:
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        log_file.close()
+        _CONSOLE_CAPTURE = None
+
+
+def _stop_active_profiler() -> Path | None:
+    global _ACTIVE_PROFILER
+    if _ACTIVE_PROFILER is None:
+        return None
+    profiler = _ACTIVE_PROFILER
+    _ACTIVE_PROFILER = None
+    output_dir = Path(profiler.output_dir)
+    profiler.stop()
+    return output_dir
+
+
+def _record_valid_simulation_unlocked(
+    *,
+    started_at: datetime,
+    start_step: int,
+    total_steps: int,
+    run_steps: int,
+    stop_reason: str,
+    model_name: str = "未知模型",
+    resumed: bool = False,
+    resume_from: str | None = None,
+    path: Path = SIMULATION_COUNT_PATH,
+) -> int | None:
+    if run_steps <= MIN_VALID_SIMULATION_STEPS:
+        return None
+
+    path = Path(path)
+    json_existed = path.exists()
+    data = _load_simulation_count_data(path)
+    # The top-level count is deliberately authoritative: users can correct it
+    # without having to manufacture/delete historical records.  The legacy txt
+    # is consulted exactly once, when the JSON file is first created.
+    existing_count = int(data.get("effective_simulation_count", 0))
+    legacy_path = _find_legacy_simulation_count_path(path)
+    legacy_count = 0
+    legacy_records: list[dict] = []
+    if not json_existed:
+        legacy_count = _read_legacy_simulation_count(legacy_path)
+        legacy_records = _read_legacy_simulation_records(legacy_path)
+        existing_count = max(existing_count, legacy_count)
+    effective_count = existing_count + 1
+
+    simulations = data.setdefault("simulations", [])
+    simulations.extend(legacy_records)
+    simulations.append(
+        {
+            "sequence": effective_count,
+            "started_at": started_at.isoformat(timespec="seconds"),
+            "date": started_at.strftime("%Y-%m-%d"),
+            "time": started_at.strftime("%H:%M:%S"),
+            "model_name": model_name,
+            "training_type": "resume" if resumed else "new",
+            "resumed": bool(resumed),
+            "resume_from": resume_from,
+            "start_step": int(start_step),
+            "end_step": int(total_steps),
+            "run_steps": int(run_steps),
+            "stop_reason": stop_reason,
+        }
+    )
+    data["schema_version"] = SIMULATION_COUNT_SCHEMA_VERSION
+    data["effective_simulation_count"] = effective_count
+    data["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+    if legacy_count:
+        migration = data.setdefault("legacy_migration", {})
+        migration["source"] = str(legacy_path.resolve())
+        migration["detected_count"] = legacy_count
+        migration["migrated_record_count"] = len(legacy_records)
+        migration["historical_count_without_detail"] = max(
+            0, legacy_count - len(legacy_records)
+        )
+        migration.setdefault(
+            "first_migrated_at", datetime.now().astimezone().isoformat(timespec="seconds")
+        )
+        migration["note"] = "原 txt 保留不变；JSON 为新的权威记录"
+    _atomic_write_json(path, data)
+    return effective_count
+
+
+def _find_legacy_simulation_count_path(json_path: Path) -> Path:
+    """兼容手工改名过的 Simulation_counting*.txt，选择累计值最大的版本。"""
+
+    preferred = json_path.with_name(LEGACY_SIMULATION_COUNT_PATH.name)
+    candidates = list(json_path.parent.glob("Simulation_counting*.txt"))
+    if preferred not in candidates:
+        candidates.append(preferred)
+    existing = [item for item in candidates if item.is_file()]
+    if not existing:
+        return preferred
+    return max(
+        existing,
+        key=lambda item: (_read_legacy_simulation_count(item), item.stat().st_mtime_ns),
+    )
+
+
+@contextmanager
+def _simulation_count_lock(path: Path, timeout_seconds: float = 30.0):
+    """用同目录独占锁保证并行训练不会领取相同的有效编号。"""
+
+    lock_path = path.with_name(f".{path.name}.lock")
+    deadline = time.monotonic() + timeout_seconds
+    descriptor: int | None = None
+    while descriptor is None:
+        try:
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(descriptor, f"pid={os.getpid()}\n".encode("ascii"))
+        except FileExistsError:
+            try:
+                stale = time.time() - lock_path.stat().st_mtime > 300
+            except FileNotFoundError:
+                continue
+            if stale:
+                try:
+                    lock_path.unlink()
+                except FileNotFoundError:
+                    pass
+                continue
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"等待模拟计数锁超时: {lock_path}")
+            time.sleep(0.05)
+    try:
+        yield
+    finally:
+        os.close(descriptor)
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _record_valid_simulation(
+    *,
+    started_at: datetime,
+    start_step: int,
+    total_steps: int,
+    run_steps: int,
+    stop_reason: str,
+    model_name: str = "未知模型",
+    resumed: bool = False,
+    resume_from: str | None = None,
+    path: Path = SIMULATION_COUNT_PATH,
+) -> int | None:
+    if run_steps <= MIN_VALID_SIMULATION_STEPS:
+        return None
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _simulation_count_lock(path):
+        return _record_valid_simulation_unlocked(
+            started_at=started_at,
+            start_step=start_step,
+            total_steps=total_steps,
+            run_steps=run_steps,
+            stop_reason=stop_reason,
+            model_name=model_name,
+            resumed=resumed,
+            resume_from=resume_from,
+            path=path,
+        )
+
+
+def _new_simulation_count_data() -> dict:
+    return {
+        "schema_version": SIMULATION_COUNT_SCHEMA_VERSION,
+        "effective_simulation_count": 0,
+        "simulations": [],
+    }
+
+
+def _load_simulation_count_data(path: Path) -> dict:
+    if not path.exists():
+        return _new_simulation_count_data()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"无法读取模拟计数 JSON: {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(f"模拟计数 JSON 顶层必须是对象: {path}")
+    try:
+        count = int(data.get("effective_simulation_count", 0))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"effective_simulation_count 必须是非负整数: {path}"
+        ) from exc
+    if count < 0:
+        raise RuntimeError(f"effective_simulation_count 不能为负数: {path}")
+    simulations = data.get("simulations", [])
+    if not isinstance(simulations, list):
+        raise RuntimeError(f"simulations 必须是数组: {path}")
+    data["effective_simulation_count"] = count
+    data["simulations"] = simulations
+    return data
+
+
+def _read_legacy_simulation_count(path: Path) -> int:
+    text = _read_legacy_simulation_text(path)
+    if text is None:
+        return 0
+
+    # A manually corrected cumulative field must win over the old line-count
+    # scheme. Sequence numbers and line count remain useful fallbacks.
+    cumulative = [
+        int(value)
+        for value in re.findall(r"累计有效模拟\s*[=:：]\s*(\d+)", text)
+    ]
+    sequences = [
+        int(value) for value in re.findall(r"有效模拟\s*#\s*(\d+)", text)
+    ]
+    matching_lines = sum(1 for line in text.splitlines() if "有效模拟" in line)
+    return max([0, matching_lines, *cumulative, *sequences])
+
+
+def _read_legacy_simulation_text(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    raw = path.read_bytes()
+    for encoding in ("utf-8-sig", "gb18030"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return None
+
+
+def _read_legacy_simulation_records(path: Path) -> list[dict]:
+    text = _read_legacy_simulation_text(path)
+    if text is None:
+        return []
+    records: list[dict] = []
+    for line in text.splitlines():
+        match = re.match(r"\s*有效模拟\s*#\s*(\d+)", line)
+        if match is None:
+            continue
+        fields: dict[str, str] = {}
+        for part in line.split("|")[1:]:
+            if "=" in part:
+                key, value = part.split("=", 1)
+                fields[key.strip()] = value.strip()
+
+        date = fields.get("日期", "")
+        clock = fields.get("时间", "")
+        started_at = f"{date}T{clock}" if date and clock else None
+
+        def parse_int(key: str) -> int | None:
+            try:
+                return int(fields[key])
+            except (KeyError, TypeError, ValueError):
+                return None
+
+        resume_from = fields.get("原PT路径")
+        if resume_from in (None, "", "无"):
+            resume_from = None
+        training_type_text = fields.get("类型", "")
+        resumed = training_type_text == "续训"
+        records.append(
+            {
+                "sequence": int(match.group(1)),
+                "started_at": started_at,
+                "date": date or None,
+                "time": clock or None,
+                "model_name": fields.get("模型", "未知模型"),
+                "training_type": "resume" if resumed else "new",
+                "resumed": resumed,
+                "resume_from": resume_from,
+                "start_step": parse_int("开始step"),
+                "end_step": parse_int("结束step"),
+                "run_steps": parse_int("本次训练步数"),
+                "stop_reason": fields.get("停止原因", "未知"),
+                "migrated_from_legacy": True,
+            }
+        )
+    return records
+
+
+def _atomic_write_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            newline="\n",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink()
+
+
+def _register_run_artifacts(*paths: Path) -> None:
+    artifacts = _SIMULATION_CONTEXT.setdefault("artifacts", [])
+    known = {str(item) for item in artifacts}
+    for path in paths:
+        value = str(Path(path))
+        if value not in known:
+            artifacts.append(value)
+            known.add(value)
+
+
+def _attach_artifacts_to_simulation(
+    sequence: int, artifacts: list[Path], path: Path | None = None
+) -> None:
+    path = Path(path or SIMULATION_COUNT_PATH)
+    with _simulation_count_lock(path):
+        data = _load_simulation_count_data(path)
+        matching = [
+            record
+            for record in data.get("simulations", [])
+            if int(record.get("sequence", -1)) == int(sequence)
+        ]
+        if not matching:
+            raise RuntimeError(f"计数 JSON 中找不到有效模拟 #{sequence}，无法登记产物")
+        matching[-1]["artifacts"] = [str(item.resolve()) for item in artifacts]
+        data["schema_version"] = SIMULATION_COUNT_SCHEMA_VERSION
+        _atomic_write_json(path, data)
+
+
+def _finalize_run_artifacts() -> list[Path]:
+    """有效训练改为 ``#N_``；无效训练保留 ``无效_`` 标记。"""
+
+    if not _SIMULATION_CONTEXT or _SIMULATION_CONTEXT.get("artifacts_finalized"):
+        return []
+    original_paths = [Path(item) for item in _SIMULATION_CONTEXT.get("artifacts", [])]
+    sequence = _SIMULATION_CONTEXT.get("sequence")
+    if sequence is None:
+        _SIMULATION_CONTEXT["artifacts_finalized"] = True
+        return [item for item in original_paths if item.exists()]
+
+    finalized: list[Path] = []
+    invalid_prefix = str(
+        _SIMULATION_CONTEXT.get("invalid_artifact_prefix", INVALID_ARTIFACT_MARKER)
+    )
+    for source in original_paths:
+        if not source.name.startswith(INVALID_ARTIFACT_MARKER):
+            destination = source
+        else:
+            suffix = (
+                source.name[len(invalid_prefix) :]
+                if source.name.startswith(invalid_prefix)
+                else source.name[len(INVALID_ARTIFACT_MARKER) :]
+            )
+            destination = source.with_name(
+                f"#{int(sequence)}_{suffix}"
+            )
+        if source.exists() and source != destination:
+            if destination.exists():
+                raise FileExistsError(f"有效模拟产物已存在，拒绝覆盖: {destination}")
+            source.replace(destination)
+        if destination.exists():
+            finalized.append(destination)
+
+    _attach_artifacts_to_simulation(
+        int(sequence),
+        finalized,
+        Path(_SIMULATION_CONTEXT.get("simulation_count_path", SIMULATION_COUNT_PATH)),
+    )
+    _SIMULATION_CONTEXT["artifacts"] = [str(item) for item in finalized]
+    _SIMULATION_CONTEXT["artifacts_finalized"] = True
+    return finalized
+
+
+def _finalize_simulation_context(stop_reason: str | None = None) -> int | None:
+    if not _SIMULATION_CONTEXT or _SIMULATION_CONTEXT.get("finalized"):
+        return None
+    if not _SIMULATION_CONTEXT.get("count_simulation", True):
+        _SIMULATION_CONTEXT["finalized"] = True
+        return None
+    if stop_reason is not None:
+        _SIMULATION_CONTEXT["stop_reason"] = stop_reason
+    count = _record_valid_simulation(
+        started_at=_SIMULATION_CONTEXT["started_at"],
+        start_step=int(_SIMULATION_CONTEXT.get("start_step", 0)),
+        total_steps=int(_SIMULATION_CONTEXT.get("total_steps", 0)),
+        run_steps=int(_SIMULATION_CONTEXT.get("run_steps", 0)),
+        stop_reason=str(_SIMULATION_CONTEXT.get("stop_reason", "未知")),
+        model_name=str(_SIMULATION_CONTEXT.get("model_name", "未知模型")),
+        resumed=bool(_SIMULATION_CONTEXT.get("resumed", False)),
+        resume_from=_SIMULATION_CONTEXT.get("resume_from"),
+    )
+    _SIMULATION_CONTEXT["sequence"] = count
+    _SIMULATION_CONTEXT["finalized"] = True
+    return count
 
 
 TRAIN_DEFAULTS = {
@@ -37,6 +498,8 @@ TRAIN_DEFAULTS = {
         "value_coef": 0.5,
         "normalize_advantages": True,
         "save_interval": 100,
+        "checkpoint_min_free_gb": 2.0,
+        "checkpoint_size_safety_factor": 1.10,
         "entropy_coef": 0.01,
         "learning_rate": 1e-4,
         "max_grad_norm": 1.0,
@@ -108,28 +571,23 @@ def _load_initial_model(policy: torch.nn.Module, path: Path, device: torch.devic
 
 
 def _select_last_survivor(env: ProtoLifeEnv) -> dict | None:
-    """选择当前仍存活且生命状态最高的个体，供灭绝时保存。"""
+    """在 GPU 上保留最佳幸存者索引；仅在真正灭绝时同步到 CPU。"""
 
     energy = env.agent_batch.state["energy"]
     health = env.agent_batch.state["health"]
     alive = energy > 0
     if env.use_health:
         alive = alive & (health > 0)
-    if not alive.any():
-        return None
-
     score = energy / max(env.energy_max, 1e-6)
     if env.use_health:
         score = score + health / max(env.health_max, 1e-6)
     score = torch.where(alive, score, torch.full_like(score, float("-inf")))
-    flat_index = int(score.reshape(-1).argmax().item())
-    agent_count = env.agent_batch.agents_per_env
-    env_idx, agent_idx = divmod(flat_index, agent_count)
+    flat_index = score.reshape(-1).argmax()
     return {
-        "env_idx": env_idx,
-        "agent_idx": agent_idx,
-        "energy": float(energy[env_idx, agent_idx].item()),
-        "health": float(health[env_idx, agent_idx].item()),
+        "flat_index": flat_index.detach().clone(),
+        "agents_per_env": env.agent_batch.agents_per_env,
+        "energy": energy.reshape(-1)[flat_index].detach().clone(),
+        "health": health.reshape(-1)[flat_index].detach().clone(),
     }
 
 
@@ -138,24 +596,44 @@ def _save_last_survivor_model(
     checkpoint_dir: Path,
     survivor: dict,
     step: int,
+    filename_prefix: str = "",
+    min_remaining_bytes: int = 2 * 1024**3,
+    size_safety_factor: float = 1.10,
 ) -> Path:
     """保存灭绝前最后存活个体的完整独立大脑。"""
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    destination = checkpoint_dir / "last_survivor.pth"
+    destination = checkpoint_dir / f"{filename_prefix}last_survivor_step_{step}.pth"
+    if "flat_index" in survivor:
+        flat_index = int(survivor["flat_index"].item())
+        env_idx, agent_idx = divmod(flat_index, int(survivor["agents_per_env"]))
+    else:
+        env_idx = int(survivor["env_idx"])
+        agent_idx = int(survivor["agent_idx"])
+    energy_value = survivor["energy"]
+    health_value = survivor["health"]
     payload = {
         "step": int(step),
-        "env_idx": survivor["env_idx"],
-        "agent_idx": survivor["agent_idx"],
-        "energy_before_final_step": survivor["energy"],
-        "health_before_final_step": survivor["health"],
+        "env_idx": env_idx,
+        "agent_idx": agent_idx,
+        "energy_before_final_step": float(
+            energy_value.item() if isinstance(energy_value, torch.Tensor) else energy_value
+        ),
+        "health_before_final_step": float(
+            health_value.item() if isinstance(health_value, torch.Tensor) else health_value
+        ),
     }
     if getattr(policy, "cnn_independent", False):
-        brain_index = survivor["env_idx"] * policy.agents_per_env + survivor["agent_idx"]
+        brain_index = env_idx * policy.agents_per_env + agent_idx
         payload["brain_state_dict"] = policy.brains[brain_index].state_dict()
     else:
         payload["policy_state_dict"] = policy.state_dict()
-    torch.save(payload, destination)
+    save_torch_payload(
+        destination,
+        payload,
+        min_remaining_bytes=min_remaining_bytes,
+        size_safety_factor=size_safety_factor,
+    )
     return destination
 
 
@@ -178,7 +656,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-dir", type=str, default=None, help="checkpoint 输出目录")
     parser.add_argument("--model-dir", type=str, default=None, help="模型目录，支持指向已有模型继续训练")
     parser.add_argument("--model-name", type=str, default=None, help="模型名称，若缺省则交互式输入")
-    parser.add_argument("--resume-from", type=str, default=None, help="从完整 checkpoint 继续推演")
+    parser.add_argument(
+        "--resume-from",
+        type=str,
+        default=None,
+        help="从旧 full 文件或新式 env/model/optim 三件套中的任一文件继续推演",
+    )
     parser.add_argument(
         "--fresh", action="store_true", help="忽略已有 checkpoint，从初始模型或随机参数开始"
     )
@@ -189,6 +672,17 @@ def parse_args() -> argparse.Namespace:
         help="无 checkpoint 时使用的初始模型；单脑模型会复制给所有个体",
     )
     parser.add_argument("--print-interval", type=int, default=None, help="训练日志打印间隔")
+    parser.add_argument(
+        "--profiler",
+        nargs="?",
+        const="config/PyTorch_Profiler.yaml",
+        default=None,
+        metavar="YAML",
+        help=(
+            "启用按需 PyTorch Profiler；省略 YAML 时使用 "
+            "config/PyTorch_Profiler.yaml"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -249,13 +743,6 @@ def _prepare_model_dir(args: argparse.Namespace, fallback_tag: str) -> tuple[Pat
     return candidate, model_name
 
 
-def _find_latest_full_checkpoint(checkpoint_dir: Path) -> Path | None:
-    if not checkpoint_dir.exists():
-        return None
-    candidates = sorted(checkpoint_dir.glob("full_step_*.pt"), key=lambda p: p.stat().st_mtime, reverse=True)
-    return candidates[0] if candidates else None
-
-
 def _clone_hidden(hidden):
     if isinstance(hidden, tuple):
         return tuple(item.detach().clone() for item in hidden)
@@ -279,8 +766,20 @@ def _forward_policy_inputs(
     agent_features: torch.Tensor | None,
     agent_obs: torch.Tensor | None,
     hidden,
+    active_mask: torch.Tensor | None = None,
+    active_indices: torch.Tensor | None = None,
+    brain_indices: list[int] | None = None,
 ):
     if getattr(policy, "use_cnn", False):
+        if getattr(policy, "cnn_independent", False):
+            return policy(
+                patch,
+                hidden,
+                agent_features,
+                active_mask=active_mask,
+                active_indices=active_indices,
+                brain_indices=brain_indices,
+            )
         return policy(patch, hidden, agent_features)
     logits, values = policy(agent_obs)
     return logits, values, None
@@ -361,29 +860,25 @@ def _normalize_valid_advantages(
     if independent:
         flat_advantages = advantages.reshape(advantages.size(0), -1)
         flat_valid = valid.reshape(valid.size(0), -1)
-        flat_normalized = normalized.reshape(normalized.size(0), -1)
-        for brain_index in range(flat_advantages.size(1)):
-            brain_mask = flat_valid[:, brain_index]
-            brain_values = flat_advantages[:, brain_index][brain_mask]
-            if brain_values.numel() == 0:
-                continue
-            if brain_values.numel() > 1:
-                brain_values = (
-                    (brain_values - brain_values.mean())
-                    / (brain_values.std(unbiased=False) + 1e-8)
-                )
-            flat_normalized[brain_mask, brain_index] = brain_values
-        return normalized
+        mask = flat_valid.to(flat_advantages.dtype)
+        counts = mask.sum(dim=0)
+        means = (flat_advantages * mask).sum(dim=0) / counts.clamp_min(1)
+        centered = flat_advantages - means
+        variances = (centered.square() * mask).sum(dim=0) / counts.clamp_min(1)
+        standardized = centered / (torch.sqrt(variances) + 1e-8)
+        # 单样本大脑沿用原 advantage，保持旧行为；无样本位置归零。
+        per_brain = torch.where(counts.unsqueeze(0) > 1, standardized, flat_advantages)
+        return (per_brain * mask).reshape_as(advantages)
 
-    valid_values = advantages[valid]
-    if valid_values.numel() == 0:
+    mask = valid.to(advantages.dtype)
+    count = mask.sum()
+    if int(count.item()) == 0:
         return normalized
-    if valid_values.numel() > 1:
-        valid_values = (valid_values - valid_values.mean()) / (
-            valid_values.std(unbiased=False) + 1e-8
-        )
-    normalized[valid] = valid_values
-    return normalized
+    mean = (advantages * mask).sum() / count
+    variance = ((advantages - mean).square() * mask).sum() / count
+    standardized = (advantages - mean) / (torch.sqrt(variance) + 1e-8)
+    values = torch.where(count > 1, standardized, advantages)
+    return values * mask
 
 
 def _ppo_clipped_surrogate(
@@ -401,17 +896,20 @@ def _masked_reduce(
         flat_values = values.reshape(values.size(0), -1)
         flat_valid = valid.reshape(valid.size(0), -1)
         sample_counts = flat_valid.sum(dim=0)
-        active_brains = sample_counts > 0
         per_brain = (flat_values * flat_valid.to(values.dtype)).sum(dim=0)
         per_brain = per_brain / sample_counts.clamp_min(1).to(values.dtype)
-        return per_brain[active_brains].sum()
-    return values[valid].mean()
+        return (per_brain * (sample_counts > 0).to(values.dtype)).sum()
+    mask = valid.to(values.dtype)
+    return (values * mask).sum() / mask.sum().clamp_min(1)
 
 
 def _clear_inactive_brain_gradients(
     policy: torch.nn.Module, valid: torch.Tensor
 ) -> None:
     if not getattr(policy, "cnn_independent", False):
+        return
+    if getattr(policy, "sparse_active_forward", False):
+        # 稀疏前向根本不会把无效大脑接入计算图，其梯度天然为 None。
         return
     active_brains = valid.any(dim=0).reshape(-1)
     for brain_index, is_active in enumerate(active_brains.tolist()):
@@ -465,6 +963,9 @@ def _ppo_update(
                     sample["agent_features"],
                     sample["agent_obs"],
                     hidden,
+                    sample["valid"],
+                    sample.get("active_indices"),
+                    sample.get("brain_indices"),
                 )
                 logits, values = _reshape_policy_outputs(
                     logits, values, sample["actions"].shape
@@ -519,13 +1020,19 @@ def _ppo_update(
             optimizer.step()
 
             with torch.no_grad():
-                valid_log_ratio = log_ratio[valid]
+                metric_mask = valid.to(log_ratio.dtype)
+                metric_count = metric_mask.sum().clamp_min(1)
                 metric_sums["policy_loss"] += float(policy_loss.item())
                 metric_sums["value_loss"] += float(value_loss.item())
                 metric_sums["entropy"] += float(entropy.item())
-                metric_sums["approx_kl"] += float((-valid_log_ratio).mean().item())
+                metric_sums["approx_kl"] += float(
+                    ((-log_ratio * metric_mask).sum() / metric_count).item()
+                )
                 metric_sums["clip_fraction"] += float(
-                    ((ratio[valid] - 1.0).abs() > clip_range).float().mean().item()
+                    (
+                        (((ratio - 1.0).abs() > clip_range).to(ratio.dtype) * metric_mask).sum()
+                        / metric_count
+                    ).item()
                 )
             update_count += 1
 
@@ -545,12 +1052,13 @@ def _save_ppo_checkpoint(
     gamma: float,
     gae_lambda: float,
     ppo_clip: float,
-) -> None:
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(policy.state_dict(), checkpoint_dir / f"model_step_{step}.pth")
-    torch.save(optimizer.state_dict(), checkpoint_dir / f"optim_step_{step}.pth")
-    save_checkpoint(
-        checkpoint_dir / f"full_step_{step}.pt",
+    filename_prefix: str = "",
+    min_remaining_bytes: int = 2 * 1024**3,
+    size_safety_factor: float = 1.10,
+) -> dict[str, Path]:
+    return save_split_checkpoint(
+        checkpoint_dir,
+        step,
         env_state=env.export_state(),
         policy_state_dict=policy.state_dict(),
         optimizer_state_dict=optimizer.state_dict(),
@@ -562,14 +1070,46 @@ def _save_ppo_checkpoint(
             "gae_lambda": gae_lambda,
             "ppo_clip": ppo_clip,
         },
+        filename_prefix=filename_prefix,
+        min_remaining_bytes=min_remaining_bytes,
+        size_safety_factor=size_safety_factor,
     )
 
 def main() -> None:
+    global _ACTIVE_PROFILER
     args = parse_args()
-    run_tag = time.strftime("%Y%m%d_%H%M%S")
+    started_at = datetime.now()
+    run_tag = started_at.strftime("%Y%m%d_%H%M%S")
     model_dir, model_name = _prepare_model_dir(args, run_tag)
     log_dir = model_dir / "log"
     checkpoint_dir = model_dir / (args.checkpoint_dir or "checkpoint")
+    artifact_run_id = secrets.token_hex(6)
+    artifact_filename_prefix = f"{INVALID_ARTIFACT_MARKER}{artifact_run_id}_"
+    _SIMULATION_CONTEXT.clear()
+    _SIMULATION_CONTEXT.update(
+        {
+            "started_at": started_at,
+            "start_step": 0,
+            "total_steps": 0,
+            "run_steps": 0,
+            "model_name": model_name,
+            "resumed": False,
+            "resume_from": None,
+            "count_simulation": True,
+            "artifacts": [],
+            "artifacts_finalized": False,
+            "sequence": None,
+            "simulation_count_path": str(SIMULATION_COUNT_PATH),
+            "invalid_artifact_prefix": artifact_filename_prefix,
+            "stop_reason": "完成配置的训练步数",
+            "finalized": False,
+        }
+    )
+    console_log_path: Path | None = None
+    if args.profiler is None:
+        console_log_path = log_dir / f"{artifact_filename_prefix}console.log"
+        _start_console_capture(console_log_path)
+        _register_run_artifacts(console_log_path)
 
     model_config_path = model_dir / f"{model_name}.yaml"
     if args.config:
@@ -590,6 +1130,32 @@ def main() -> None:
     print(f"模型目录: {model_dir.resolve()}")
     print(f"配置文件: {config_path.resolve()}")
     print(f"Checkpoint 目录: {checkpoint_dir.resolve()}")
+    if console_log_path is not None:
+        print(f"控制台日志: {console_log_path.resolve()}")
+    else:
+        print("Profiler 模式：不保存训练 log、有效模拟计数或 checkpoint。")
+
+    profiler_session = None
+    if args.profiler is not None:
+        # 延迟导入：普通训练不会初始化或导入 Kineto profiler 模块。
+        from protolife.profiler import create_profiler
+
+        profiler_config_path = Path(args.profiler)
+        profiler_session = create_profiler(
+            profiler_config_path,
+            model_name=model_name,
+            metadata={
+                "model_name": model_name,
+                "model_dir": str(model_dir.resolve()),
+                "training_config": str(config_path.resolve()),
+                "profiler_config": str(profiler_config_path.resolve()),
+                "checkpoint_dir": str(checkpoint_dir.resolve()),
+            },
+        )
+        _SIMULATION_CONTEXT["count_simulation"] = False
+        print(f"PyTorch Profiler 配置: {profiler_config_path.resolve()}")
+        print(f"Profiler 测试步数: {profiler_session.total_steps}")
+
     set_seed(resolved_seed)
     if torch.cuda.is_available():
         torch.set_float32_matmul_precision("high")
@@ -617,7 +1183,8 @@ def main() -> None:
         print(f"已启用 {policy.brain_count} 个完全独立的 CNN 个体大脑")
 
     logger = None
-    if get_cfg(config, default_config, "logging", "save_dir", True):
+    replay_logging_enabled = profiler_session is None
+    if get_cfg(config, default_config, "logging", "save_dir", True) and replay_logging_enabled:
         from protolife.logger import ExperimentLogger
 
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -625,7 +1192,7 @@ def main() -> None:
             save_dir=log_dir,
             snapshot_interval=get_cfg(config, default_config, "logging", "snapshot_interval", 50),
             env_index=get_cfg(config, default_config, "logging", "env_index", 0),
-            run_tag=run_tag,
+            run_tag=artifact_run_id,
             metadata={
                 "height": env.height,
                 "width": env.width,
@@ -637,7 +1204,9 @@ def main() -> None:
                 "run_name": model_dir.name,
                 "run_tag": run_tag,
                 "map_file": env.map_file,
+                "food_lifetime": getattr(env, "food_lifetime", None),
                 "toxin_lifetime": getattr(env, "toxin_lifetime", None),
+                "console_log": str(console_log_path),
                 "use_health": env.use_health,
             },
             buffer_on_gpu=get_cfg(
@@ -646,13 +1215,30 @@ def main() -> None:
             flush_interval=get_cfg(
                 config, default_config, "logging", "snapshot_flush_interval", 8
             ),
+            filename_prefix=INVALID_ARTIFACT_MARKER,
         )
+        _register_run_artifacts(logger.map_log, logger.agent_log)
+    elif profiler_session is not None and not replay_logging_enabled:
+        print("Profiler 模式强制关闭 replay 日志，避免 I/O 干扰性能测量。")
 
     checkpoint_dir = Path(checkpoint_dir)
     save_interval = int(
         args.save_interval
         or get_cfg(config, default_config, "training", "save_interval", 100)
     )
+    checkpoint_min_free_gb = float(
+        get_cfg(config, default_config, "training", "checkpoint_min_free_gb", 2.0)
+    )
+    checkpoint_size_safety_factor = float(
+        get_cfg(
+            config,
+            default_config,
+            "training",
+            "checkpoint_size_safety_factor",
+            1.10,
+        )
+    )
+    checkpoint_min_remaining_bytes = int(checkpoint_min_free_gb * 1024**3)
     print_actions = bool(get_cfg(config, default_config, "training", "print_actions", False))
     entropy_coef = float(
         get_cfg(config, default_config, "training", "entropy_coef", 0.01)
@@ -713,6 +1299,10 @@ def main() -> None:
 
     if save_interval <= 0:
         raise ValueError("training.save_interval 必须大于 0")
+    if checkpoint_min_free_gb < 0:
+        raise ValueError("training.checkpoint_min_free_gb 不能为负数")
+    if checkpoint_size_safety_factor < 1.0:
+        raise ValueError("training.checkpoint_size_safety_factor 不能小于 1")
     if n_steps <= 0:
         raise ValueError("training.n_steps 必须大于 0")
     if not 0 < gamma <= 1:
@@ -744,15 +1334,20 @@ def main() -> None:
     start_step = 0
     auto_resume = bool(get_cfg(config, default_config, "training", "auto_resume", True))
     latest_checkpoint = (
-        _find_latest_full_checkpoint(checkpoint_dir)
+        find_latest_checkpoint(checkpoint_dir)
         if auto_resume and not args.fresh
         else None
     )
     checkpoint_path = Path(args.resume_from) if args.resume_from else latest_checkpoint
+    resolved_checkpoint_path = (
+        str(checkpoint_path.resolve()) if checkpoint_path is not None else None
+    )
 
     if checkpoint_path:
         print(f"使用的 checkpoint: {checkpoint_path.resolve()}")
         env_state, policy_state, optim_state, meta = load_checkpoint(checkpoint_path, map_location=env.device)
+        has_env_rng_state = "random_generator_state" in env_state
+        global_rng_state = meta.pop("_rng_state", None)
         env.load_state(env_state)
         skipped = _load_state_dict_lenient(policy, policy_state)
         checkpoint_algorithm = meta.get("algorithm")
@@ -766,6 +1361,14 @@ def main() -> None:
         start_step = int(meta.get("step", 0))
         env.step_count = start_step
         obs = env._build_observations()
+        rng_fully_restored = restore_rng_state(global_rng_state)
+        if not has_env_rng_state or not rng_fully_restored:
+            print(
+                "[警告] checkpoint 缺少部分 RNG 状态或当前设备拓扑不同；"
+                "本次续训可正常进行，但随机序列不能与保存点完全衔接。"
+            )
+        else:
+            print("已恢复 Python、NumPy、PyTorch CPU/CUDA 与环境 RNG 状态。")
         print(f"从 checkpoint 恢复，起始 step={start_step}，来源: {checkpoint_path}")
     else:
         print("未恢复 checkpoint，将开始新的训练。")
@@ -783,6 +1386,16 @@ def main() -> None:
                     raise FileNotFoundError(f"找不到初始模型: {initial_model}")
             _load_initial_model(policy, initial_model_path, env.device)
 
+    _SIMULATION_CONTEXT.update(
+        {
+            "start_step": start_step,
+            "total_steps": start_step,
+            "run_steps": 0,
+            "resumed": checkpoint_path is not None,
+            "resume_from": resolved_checkpoint_path,
+        }
+    )
+
     if logger:
         logger.metadata["start_step"] = start_step
         logger.metadata["resumed_from_step"] = start_step
@@ -790,17 +1403,43 @@ def main() -> None:
         logger.step_counter = start_step
         logger._write_header()
 
+    if profiler_session is not None:
+        profiler_session.metadata.update(
+            {
+                "device": str(env.device),
+                "start_step": start_step,
+                "resume_from": resolved_checkpoint_path,
+                "num_envs": env.agent_batch.num_envs,
+                "agents_per_env": env.agent_batch.agents_per_env,
+                "n_steps": n_steps,
+                "ppo_epochs": ppo_epochs,
+                "ppo_minibatch_steps": ppo_minibatch_steps,
+            }
+        )
+        profiler_session.start()
+        _ACTIVE_PROFILER = profiler_session
+        print(f"Profiler 报告目录: {profiler_session.output_dir.resolve()}")
+
     total_steps = start_step
     run_steps = 0
-    rollout_steps = int(
-        get_cfg(config, default_config, "training", "rollout_steps", 128)
+    rollout_steps = (
+        profiler_session.total_steps
+        if profiler_session is not None
+        else int(get_cfg(config, default_config, "training", "rollout_steps", 128))
     )
-    next_checkpoint_step = (total_steps // save_interval + 1) * save_interval
+    save_checkpoints_enabled = profiler_session is None
+    next_checkpoint_step = (
+        (total_steps // save_interval + 1) * save_interval
+        if save_checkpoints_enabled
+        else total_steps + rollout_steps + 1
+    )
     last_checkpoint_step = start_step if checkpoint_path else None
     last_print_time = time.perf_counter()
     last_print_step = total_steps
     final_reward_mean = None
     stop_training = False
+    stop_reason = "完成配置的训练步数"
+    extinction_survivor = None
 
     while run_steps < rollout_steps and not stop_training:
         rollout: list[dict] = []
@@ -813,13 +1452,18 @@ def main() -> None:
             next_checkpoint_step - total_steps,
         )
 
-        for _ in range(rollout_limit):
+        for rollout_index in range(rollout_limit):
             valid = obs["alive"].detach().clone()
-            last_survivor = _select_last_survivor(env)
-            if last_survivor is None and env.use_death:
+            active_indices = torch.nonzero(valid.reshape(-1), as_tuple=False).flatten()
+            brain_indices = active_indices.detach().cpu().tolist()
+            has_valid_agents = bool(brain_indices)
+            if not has_valid_agents and env.use_death:
                 print("所有个体在本轮开始前已经死亡，训练停止。")
+                stop_reason = "开始 rollout 时已无存活个体"
+                _SIMULATION_CONTEXT["stop_reason"] = stop_reason
                 stop_training = True
                 break
+            last_survivor = _select_last_survivor(env) if has_valid_agents else None
 
             hidden = _clone_hidden(_current_hidden(env))
             patch = (
@@ -840,7 +1484,14 @@ def main() -> None:
 
             with torch.no_grad():
                 logits, values, new_hidden = _forward_policy_inputs(
-                    policy, patch, agent_features, agent_obs, hidden
+                    policy,
+                    patch,
+                    agent_features,
+                    agent_obs,
+                    hidden,
+                    valid,
+                    active_indices,
+                    brain_indices,
                 )
                 logits, values = _reshape_policy_outputs(
                     logits, values, valid.shape
@@ -901,15 +1552,21 @@ def main() -> None:
                     "old_values": values.detach(),
                     "rewards": rewards,
                     "valid": valid,
+                    "active_indices": active_indices,
+                    "brain_indices": brain_indices,
                     "continuation": continuation,
                     "logit_noise": logit_noise.detach(),
                 }
             )
 
-            final_reward_mean = float(rewards[valid].mean().item()) if valid.any() else 0.0
+            final_reward_mean = (
+                float(rewards[valid].mean().item()) if has_valid_agents else 0.0
+            )
             obs = next_obs
             total_steps += 1
             run_steps += 1
+            _SIMULATION_CONTEXT["total_steps"] = total_steps
+            _SIMULATION_CONTEXT["run_steps"] = run_steps
 
             if logger:
                 logger.maybe_log(
@@ -917,8 +1574,17 @@ def main() -> None:
                 )
 
             all_dead = env.use_death and not bool(obs["alive"].any().item())
+            profile_rollout_boundary = (
+                rollout_index + 1 >= rollout_limit
+                or all_dead
+                or bool(step_result.reproduction_events)
+            )
+            if profiler_session is not None and not profile_rollout_boundary:
+                profiler_session.step()
             if all_dead:
                 final_survivor = last_survivor
+                stop_reason = "所有个体死亡"
+                _SIMULATION_CONTEXT["stop_reason"] = stop_reason
                 stop_training = True
                 break
 
@@ -935,12 +1601,21 @@ def main() -> None:
                 bootstrap_values = torch.zeros_like(rollout[-1]["old_values"])
             else:
                 bootstrap_hidden = _clone_hidden(_current_hidden(env))
+                bootstrap_active_indices = torch.nonzero(
+                    obs["alive"].reshape(-1), as_tuple=False
+                ).flatten()
+                bootstrap_brain_indices = (
+                    bootstrap_active_indices.detach().cpu().tolist()
+                )
                 bootstrap_logits, bootstrap_values, _ = _forward_policy_inputs(
                     policy,
                     obs["patch"] if getattr(policy, "use_cnn", False) else None,
                     obs["agent_features"] if getattr(policy, "use_cnn", False) else None,
                     None if getattr(policy, "use_cnn", False) else obs["agent_obs"],
                     bootstrap_hidden,
+                    obs["alive"],
+                    bootstrap_active_indices,
+                    bootstrap_brain_indices,
                 )
                 _, bootstrap_values = _reshape_policy_outputs(
                     bootstrap_logits, bootstrap_values, obs["alive"].shape
@@ -992,6 +1667,11 @@ def main() -> None:
                 for parameter in inherited_parameters:
                     optimizer.state.pop(parameter, None)
 
+        # 每个 rollout 的最后一个 profiler step 延后到 PPO 更新之后，确保反向传播
+        # 和 optimizer.step 不会落在 active 窗口之外。
+        if profiler_session is not None:
+            profiler_session.step()
+
         if print_interval > 0 and (
             total_steps - last_print_step >= print_interval or stop_training
         ):
@@ -1014,8 +1694,10 @@ def main() -> None:
             else:
                 step_rate_text = "n/a"
                 model_speed_text = "n/a"
+            current_agent_count = int(obs["alive"].sum().item())
             print(
-                f"steps:{total_steps} reward_mean:{final_reward_mean:.6f} "
+                f"steps:{total_steps} agent_count:{current_agent_count} "
+                f"reward_mean:{final_reward_mean:.6f} "
                 f"policy_loss:{ppo_metrics['policy_loss']:.6f} "
                 f"value_loss:{ppo_metrics['value_loss']:.6f} "
                 f"entropy:{ppo_metrics['entropy']:.6f} "
@@ -1027,7 +1709,58 @@ def main() -> None:
             last_print_step = total_steps
 
         if total_steps >= next_checkpoint_step:
-            _save_ppo_checkpoint(
+            try:
+                checkpoint_paths = _save_ppo_checkpoint(
+                    policy,
+                    optimizer,
+                    env,
+                    checkpoint_dir,
+                    total_steps,
+                    n_steps=n_steps,
+                    gamma=gamma,
+                    gae_lambda=gae_lambda,
+                    ppo_clip=ppo_clip,
+                    filename_prefix=artifact_filename_prefix,
+                    min_remaining_bytes=checkpoint_min_remaining_bytes,
+                    size_safety_factor=checkpoint_size_safety_factor,
+                )
+            except InsufficientCheckpointSpaceError as exc:
+                stop_reason = "checkpoint 磁盘空间不足，未写入并停止训练"
+                _SIMULATION_CONTEXT["stop_reason"] = stop_reason
+                save_checkpoints_enabled = False
+                stop_training = True
+                print(f"[停止] {exc}")
+                break
+            _register_run_artifacts(*checkpoint_paths.values())
+            last_checkpoint_step = total_steps
+            print(f"已保存 checkpoint 至 {checkpoint_dir}, step={total_steps}")
+            while next_checkpoint_step <= total_steps:
+                next_checkpoint_step += save_interval
+        if all_dead:
+            extinction_survivor = final_survivor
+            print("所有个体已死亡，训练停止。")
+            break
+
+    if profiler_session is not None:
+        profiler_session.metadata.update(
+            {
+                "end_step": total_steps,
+                "run_steps": run_steps,
+                "final_agent_count": int(obs["alive"].sum().item()),
+                "stop_reason": stop_reason,
+            }
+        )
+    profiler_output_dir = _stop_active_profiler()
+    if profiler_output_dir is not None:
+        print(f"Profiler 报告已生成: {profiler_output_dir.resolve()}")
+
+    if (
+        save_checkpoints_enabled
+        and run_steps > 0
+        and last_checkpoint_step != total_steps
+    ):
+        try:
+            checkpoint_paths = _save_ppo_checkpoint(
                 policy,
                 optimizer,
                 env,
@@ -1037,40 +1770,79 @@ def main() -> None:
                 gamma=gamma,
                 gae_lambda=gae_lambda,
                 ppo_clip=ppo_clip,
+                filename_prefix=artifact_filename_prefix,
+                min_remaining_bytes=checkpoint_min_remaining_bytes,
+                size_safety_factor=checkpoint_size_safety_factor,
             )
+        except InsufficientCheckpointSpaceError as exc:
+            stop_reason = "checkpoint 磁盘空间不足，最终存档未写入"
+            _SIMULATION_CONTEXT["stop_reason"] = stop_reason
+            print(f"[停止] {exc}")
+        else:
+            _register_run_artifacts(*checkpoint_paths.values())
             last_checkpoint_step = total_steps
-            print(f"已保存 checkpoint 至 {checkpoint_dir}, step={total_steps}")
-            while next_checkpoint_step <= total_steps:
-                next_checkpoint_step += save_interval
-        if all_dead:
-            survivor_path = _save_last_survivor_model(
-                policy, checkpoint_dir, final_survivor, total_steps
-            )
-            print(
-                f"所有个体已死亡，训练停止；最后存活个体模型已保存至: {survivor_path}"
-            )
-            break
+            print(f"已保存最终 checkpoint 至 {checkpoint_dir}, step={total_steps}")
 
-    if run_steps > 0 and last_checkpoint_step != total_steps:
-        _save_ppo_checkpoint(
-            policy,
-            optimizer,
-            env,
-            checkpoint_dir,
-            total_steps,
-            n_steps=n_steps,
-            gamma=gamma,
-            gae_lambda=gae_lambda,
-            ppo_clip=ppo_clip,
-        )
-        print(f"已保存最终 checkpoint 至 {checkpoint_dir}, step={total_steps}")
+    if (
+        extinction_survivor is not None
+        and save_checkpoints_enabled
+        and last_checkpoint_step == total_steps
+    ):
+        try:
+            survivor_path = _save_last_survivor_model(
+                policy,
+                checkpoint_dir,
+                extinction_survivor,
+                total_steps,
+                filename_prefix=artifact_filename_prefix,
+                min_remaining_bytes=checkpoint_min_remaining_bytes,
+                size_safety_factor=checkpoint_size_safety_factor,
+            )
+        except InsufficientCheckpointSpaceError as exc:
+            print(f"[警告] 完整 checkpoint 已保存，但最后存活模型空间不足: {exc}")
+        else:
+            _register_run_artifacts(survivor_path)
+            print(f"最后存活个体模型已保存至: {survivor_path}")
 
     if logger:
         logger.flush()
 
+    effective_count = _finalize_simulation_context(stop_reason)
+    if effective_count is not None:
+        print(
+            f"本次模拟已计入 {SIMULATION_COUNT_PATH}，"
+            f"累计有效模拟: {effective_count}"
+        )
+
     if final_reward_mean is not None:
         print("训练完成，最终奖励均值:", final_reward_mean)
 
+    _stop_console_capture()
+    finalized_artifacts = _finalize_run_artifacts()
+    if effective_count is not None:
+        print(
+            f"已将 {len(finalized_artifacts)} 个训练产物改名为 "
+            f"#{effective_count}_..."
+        )
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n用户中断训练。")
+        count = _finalize_simulation_context("用户中断")
+        if count is not None:
+            print(f"累计有效模拟: {count}")
+    except Exception as exc:
+        _finalize_simulation_context(f"异常停止: {type(exc).__name__}")
+        traceback.print_exc()
+        raise SystemExit(1) from exc
+    finally:
+        try:
+            _stop_active_profiler()
+        finally:
+            try:
+                _stop_console_capture()
+            finally:
+                _finalize_run_artifacts()

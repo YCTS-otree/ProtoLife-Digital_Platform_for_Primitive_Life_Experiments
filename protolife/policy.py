@@ -198,6 +198,7 @@ class IndependentCNNPolicies(nn.Module):
         super().__init__()
         self.use_cnn = True
         self.cnn_independent = True
+        self.sparse_active_forward = True
         self.num_envs = int(num_envs)
         self.agents_per_env = int(agents_per_env)
         self.brain_count = self.num_envs * self.agents_per_env
@@ -216,15 +217,17 @@ class IndependentCNNPolicies(nn.Module):
         biases = torch.stack([layer.bias for layer in layers], dim=0)
         return torch.bmm(weights, inputs.unsqueeze(-1)).squeeze(-1) + biases
 
-    def _encode_all_patches(self, patches: torch.Tensor) -> torch.Tensor:
-        """使用分组卷积一次并行执行所有互不共享参数的 CNN。"""
+    def _encode_selected_patches(
+        self, patches: torch.Tensor, brain_indices: list[int]
+    ) -> torch.Tensor:
+        """只对存活/有效槽位执行分组卷积，跳过无梯度价值的死亡大脑。"""
 
         x = patches
-        brain_count = self.brain_count
+        brain_count = len(brain_indices)
         conv_pair_count = len(self.brains[0].cnn) // 2
         for pair_idx in range(conv_pair_count):
             conv_idx = pair_idx * 2
-            layers = [brain.cnn[conv_idx] for brain in self.brains]
+            layers = [self.brains[index].cnn[conv_idx] for index in brain_indices]
             out_channels = layers[0].out_channels
             weights = torch.cat([layer.weight for layer in layers], dim=0)
             biases = torch.cat([layer.bias for layer in layers], dim=0)
@@ -242,7 +245,9 @@ class IndependentCNNPolicies(nn.Module):
             )
 
         x = self.brains[0].pool(x).reshape(brain_count, -1)
-        projected = self._batched_linear(x, [brain.proj for brain in self.brains])
+        projected = self._batched_linear(
+            x, [self.brains[index].proj for index in brain_indices]
+        )
         return torch.relu(projected)
 
     def _advance_all_memories(
@@ -250,15 +255,19 @@ class IndependentCNNPolicies(nn.Module):
         inputs: torch.Tensor,
         hidden: torch.Tensor | None,
         cell: torch.Tensor | None,
+        brain_indices: list[int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        selected_count = inputs.size(0)
         if hidden is None:
             hidden = torch.zeros(
-                self.brain_count,
+                selected_count,
                 self.rnn_hidden_dim,
                 device=inputs.device,
                 dtype=inputs.dtype,
             )
-        rnn_layers = [brain.rnn for brain in self.brains]
+        if brain_indices is None:
+            brain_indices = list(range(self.brain_count))
+        rnn_layers = [self.brains[index].rnn for index in brain_indices]
         weight_ih = torch.stack([layer.weight_ih_l0 for layer in rnn_layers], dim=0)
         weight_hh = torch.stack([layer.weight_hh_l0 for layer in rnn_layers], dim=0)
         bias_ih = torch.stack([layer.bias_ih_l0 for layer in rnn_layers], dim=0)
@@ -292,6 +301,9 @@ class IndependentCNNPolicies(nn.Module):
         patch: torch.Tensor,
         hidden_state: Optional[torch.Tensor | Tuple[torch.Tensor, torch.Tensor]],
         agent_features: Optional[torch.Tensor] = None,
+        active_mask: Optional[torch.Tensor] = None,
+        active_indices: Optional[torch.Tensor] = None,
+        brain_indices: Optional[list[int]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor | Tuple[torch.Tensor, torch.Tensor]]:
         num_envs, agents_per_env = patch.shape[:2]
         if num_envs != self.num_envs or agents_per_env != self.agents_per_env:
@@ -301,42 +313,113 @@ class IndependentCNNPolicies(nn.Module):
                 f"实际 ({num_envs}, {agents_per_env})"
             )
 
+        if active_indices is None:
+            if active_mask is None:
+                active_indices = torch.arange(self.brain_count, device=patch.device)
+            else:
+                active_indices = torch.nonzero(
+                    active_mask.reshape(-1).to(device=patch.device), as_tuple=False
+                ).flatten()
+        else:
+            active_indices = active_indices.to(device=patch.device, dtype=torch.long)
+        active_count = int(active_indices.numel())
+        if active_count == 0:
+            logits = torch.zeros(
+                num_envs,
+                agents_per_env,
+                len(action_space),
+                device=patch.device,
+                dtype=patch.dtype,
+            )
+            values = torch.zeros(
+                num_envs, agents_per_env, 1, device=patch.device, dtype=patch.dtype
+            )
+            hidden_out = torch.zeros(
+                num_envs,
+                agents_per_env,
+                self.rnn_hidden_dim,
+                device=patch.device,
+                dtype=patch.dtype,
+            )
+            return (
+                (logits, values, (hidden_out, hidden_out.clone()))
+                if self.rnn_type == "lstm"
+                else (logits, values, hidden_out)
+            )
+
+        if brain_indices is None:
+            brain_indices = active_indices.detach().cpu().tolist()
         patch_flat = patch.reshape(self.brain_count, *patch.shape[2:])
-        encoded_patch = self._encode_all_patches(patch_flat)
+        selected_patches = patch_flat.index_select(0, active_indices)
+        encoded_patch = self._encode_selected_patches(selected_patches, brain_indices)
         if agent_features is None:
             feature_flat = torch.zeros(
-                self.brain_count, 3, device=patch.device, dtype=patch.dtype
+                active_count,
+                self.brains[0].agent_feature_dim,
+                device=patch.device,
+                dtype=patch.dtype,
             )
         else:
-            feature_flat = agent_features.reshape(self.brain_count, -1).to(
-                device=patch.device, dtype=patch.dtype
+            feature_flat = (
+                agent_features.reshape(self.brain_count, -1)
+                .index_select(0, active_indices)
+                .to(device=patch.device, dtype=patch.dtype)
             )
         encoded = torch.cat([encoded_patch, feature_flat], dim=-1)
 
         if isinstance(hidden_state, tuple):
-            hidden_flat = hidden_state[0].reshape(self.brain_count, -1)
-            cell_flat = hidden_state[1].reshape(self.brain_count, -1)
+            hidden_flat = hidden_state[0].reshape(self.brain_count, -1).index_select(
+                0, active_indices
+            )
+            cell_flat = hidden_state[1].reshape(self.brain_count, -1).index_select(
+                0, active_indices
+            )
         elif hidden_state is not None:
-            hidden_flat = hidden_state.reshape(self.brain_count, -1)
+            hidden_flat = hidden_state.reshape(self.brain_count, -1).index_select(
+                0, active_indices
+            )
             cell_flat = None
         else:
             hidden_flat = None
             cell_flat = None
 
         new_hidden, new_cell = self._advance_all_memories(
-            encoded, hidden_flat, cell_flat
+            encoded, hidden_flat, cell_flat, brain_indices
         )
-        logits = self._batched_linear(
-            new_hidden, [brain.policy_head for brain in self.brains]
-        ).reshape(num_envs, agents_per_env, -1)
-        values = self._batched_linear(
-            new_hidden, [brain.value_head for brain in self.brains]
-        ).reshape(num_envs, agents_per_env, 1)
-        hidden_out = new_hidden.reshape(num_envs, agents_per_env, -1)
+        selected_logits = self._batched_linear(
+            new_hidden, [self.brains[index].policy_head for index in brain_indices]
+        )
+        selected_values = self._batched_linear(
+            new_hidden, [self.brains[index].value_head for index in brain_indices]
+        )
+        logits_flat = torch.zeros(
+            self.brain_count,
+            selected_logits.size(-1),
+            device=patch.device,
+            dtype=selected_logits.dtype,
+        ).index_copy(0, active_indices, selected_logits)
+        values_flat = torch.zeros(
+            self.brain_count,
+            1,
+            device=patch.device,
+            dtype=selected_values.dtype,
+        ).index_copy(0, active_indices, selected_values)
+        hidden_flat_out = torch.zeros(
+            self.brain_count,
+            self.rnn_hidden_dim,
+            device=patch.device,
+            dtype=new_hidden.dtype,
+        ).index_copy(0, active_indices, new_hidden)
+        logits = logits_flat.reshape(num_envs, agents_per_env, -1)
+        values = values_flat.reshape(num_envs, agents_per_env, 1)
+        hidden_out = hidden_flat_out.reshape(num_envs, agents_per_env, -1)
         if new_cell is not None:
+            cell_flat_out = torch.zeros_like(hidden_flat_out).index_copy(
+                0, active_indices, new_cell
+            )
             return logits, values, (
                 hidden_out,
-                new_cell.reshape(num_envs, agents_per_env, -1),
+                cell_flat_out.reshape(num_envs, agents_per_env, -1),
             )
         return logits, values, hidden_out
 

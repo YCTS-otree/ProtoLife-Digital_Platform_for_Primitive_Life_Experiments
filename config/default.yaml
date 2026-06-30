@@ -6,6 +6,7 @@ world:
   food_density: 0.08  # 初始食物密度
   toxin_density: 0.05  # 初始毒素密度
   food_respawn_interval: 256  # 每隔多少步重新撒一次食物，0 表示关闭
+  food_lifetime: 2048  # 食物存续步数，达到后腐败消失；0 表示关闭
   toxin_respawn_interval: 256  # 每隔多少步重新撒一次毒素，0 表示关闭
   toxin_lifetime: 257   # 毒素存续步数，超过后自动衰减
   random_seed: 42  # 随机种子，方便复现
@@ -81,9 +82,11 @@ training:
     gaussian_std: 0.001  # 对 logits 添加的高斯噪声标准差
     epsilon: 0.001  # 以 epsilon 概率使用均匀随机动作（epsilon-greedy）
   save_interval: 4096  # 模型/存档保存间隔
+  checkpoint_min_free_gb: 2.0  # checkpoint 完整写入后至少保留的磁盘空间
+  checkpoint_size_safety_factor: 1.10  # 按估算体积预留的额外写入裕量
   checkpoint_dir: K:/Proto_Digital_Life/checkpoints  # checkpoint 输出目录
   initial_model: null  # 可选的单个体初始模型；为空时使用随机初始化，填写后复制给全部个体
-  auto_resume: true  # 默认自动恢复模型目录中最新的完整 checkpoint；设为 false 可强制新训练
+  auto_resume: true  # 默认自动恢复模型目录中最新的三文件或旧 full checkpoint；设为 false 可强制新训练
   print_actions: false  # 是否打印每步动作，便于调试
   print_interval: 256  # 进度打印间隔（步数）
 
@@ -143,7 +146,7 @@ rewards:
   move_collision_penalty: -0.02  # 移动撞墙或越界时的动作奖励（替代 MOVE 奖励）
   toxin_eat_penalty: -0.4    # 在毒物格执行 EAT 额外惩罚
   enable_proximity_reward: true  # 是否启用视野内食物距离奖励
-  see_food_reward: 0.001          # 视野中发现食物的基础奖励（距离衰减前）
+  see_food_reward: 0.001          # 每个可见食物的基础奖励（各自距离衰减后累加）
   stand_on_food_reward: 0.03      # 踩在食物格上的基础奖励
   vision_decay_mode: log       # 距离衰减模式：linear 或 log
   vision_decay_coefficient: 1.0   # 距离衰减系数（随距离增大奖励降低）

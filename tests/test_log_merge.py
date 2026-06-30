@@ -3,7 +3,7 @@ from pathlib import Path
 from scripts.plot_agent_count_v1 import LogData, combine_logs
 
 
-def test_newer_file_overrides_overlapping_steps():
+def test_overlapping_steps_from_different_files_are_preserved():
     newer = LogData(
         path=Path("newer.jsonl"),
         steps=[2, 3],
@@ -23,6 +23,6 @@ def test_newer_file_overrides_overlapping_steps():
 
     steps, counts, ordered = combine_logs([newer, older])
 
-    assert steps == [1, 2, 3]
-    assert counts == [10, 20, 30]
-    assert [log.path.name for log in ordered] == ["older.jsonl", "newer.jsonl"]
+    assert steps == [1, 2, 2, 3]
+    assert counts == [10, 20, 11, 30]
+    assert [log.path.name for log in ordered] == ["newer.jsonl", "older.jsonl"]

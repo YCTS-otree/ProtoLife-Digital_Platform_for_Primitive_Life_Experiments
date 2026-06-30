@@ -1,0 +1,36 @@
+# 仅在 train_phase0.py 显式传入 profiler 参数时读取；普通训练不会导入 profiler。
+profiler:
+  # 本次性能测试实际运行的环境 step 数，会临时覆盖训练配置中的 rollout_steps。
+  test_steps: 64
+
+  # 先完全跳过 N 步，避开 CUDA lazy init、缓存预热等一次性开销。
+  skip_first: 8
+  # 每个采样周期：wait 不记录，warmup 预热采集器，active 生成报告。
+  wait: 2
+  warmup: 2
+  # 默认让 active 一直覆盖到第 64 步，以便 n_steps 较大时仍能采到末尾 PPO 更新。
+  active: 52
+  repeat: 1
+
+  # light 开销最低；balanced 加 shape/内存；deep 再加调用栈和 FLOPs。
+  intensity: light
+  activities: [cpu, cuda]
+
+  # null 表示采用 intensity 预设；改成 true/false 可逐项覆盖。
+  record_shapes: null
+  profile_memory: null
+  with_stack: null
+  with_flops: null
+  with_modules: null
+
+  # Profiler 模式固定不保存训练 log/checkpoint，也不计入有效模拟；
+  # 仅 profiler_reports 中的性能调查报告会写盘。
+
+report:
+  output_dir: profiler_reports
+  sort_by: self_cuda_time_total
+  row_limit: 50
+  chrome_trace: true
+  operator_table: true
+  # 仅 with_stack: true 时有效；导出火焰图原始 stack 数据会增加报告体积。
+  export_stacks: false

@@ -24,6 +24,7 @@ class ExperimentLogger:
         buffer_on_gpu: bool = False,
         flush_interval: int = 8,
         start_step: int = 0,
+        filename_prefix: str = "",
     ):
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
@@ -35,8 +36,8 @@ class ExperimentLogger:
         self.flush_interval = max(int(flush_interval), 1)
         self._gpu_buffer: List[Tuple[torch.Tensor, torch.Tensor, int]] = []
         tag = self.run_tag or time.strftime("%Y%m%d_%H%M%S")
-        self.map_log = self.save_dir / f"{tag}_map.log"
-        self.agent_log = self.save_dir / f"{tag}_agents.jsonl"
+        self.map_log = self.save_dir / f"{filename_prefix}{tag}_map.log"
+        self.agent_log = self.save_dir / f"{filename_prefix}{tag}_agents.jsonl"
         self.step_counter = int(start_step)
         self.metadata.setdefault("start_step", self.step_counter)
         self._write_header()

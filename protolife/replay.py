@@ -35,6 +35,18 @@ class ReplayReader:
                     continue
                 yield line.strip()
 
+    def iter_frames(self, start_step: int = 0) -> Iterator[tuple[str, Dict]]:
+        """按 map/agent 对齐读取，并跳过 start_step 之前的帧。"""
+
+        for map_line, agent_line in zip(self.iter_maps(), self.iter_agents()):
+            try:
+                agent_data = json.loads(agent_line)
+            except json.JSONDecodeError:
+                continue
+            if int(agent_data.get("step", 0)) < start_step:
+                continue
+            yield map_line, agent_data
+
     @staticmethod
     def _read_metadata(path: Path) -> Dict:
         try:
@@ -95,7 +107,21 @@ def _resolve_log_pairs(target: str) -> List[Tuple[Path, Path]]:
     return _collect_log_pairs(log_dir)
 
 
-def _select_pairs(pairs: List[Tuple[Path, Path]]) -> List[Tuple[Path, Path]]:
+def _file_creation_time_ns(path: Path) -> int:
+    stat = path.stat()
+    birthtime = getattr(stat, "st_birthtime", None)
+    if birthtime is not None:
+        return int(birthtime * 1_000_000_000)
+    return stat.st_ctime_ns
+
+
+def _select_pairs(
+    pairs: List[Tuple[Path, Path]], *, use_latest: bool = False
+) -> List[Tuple[Path, Path]]:
+    if not pairs:
+        return pairs
+    if use_latest:
+        return [max(pairs, key=lambda pair: _file_creation_time_ns(pair[0]))]
     if len(pairs) <= 1:
         return pairs
 
@@ -111,7 +137,7 @@ def _select_pairs(pairs: List[Tuple[Path, Path]]) -> List[Tuple[Path, Path]]:
         print(f"[{idx}] {map_log.name} (size:{map_size}, run:{run_name})")
     choice = input("选择需要回放的序号（回车播放全部）: ").strip()
     if not choice:
-        return sorted(pairs, key=lambda p: p[0].stat().st_mtime)
+        return sorted(pairs, key=lambda pair: _file_creation_time_ns(pair[0]))
     try:
         idx = int(choice)
         if 0 <= idx < len(pairs):
@@ -119,7 +145,7 @@ def _select_pairs(pairs: List[Tuple[Path, Path]]) -> List[Tuple[Path, Path]]:
     except ValueError:
         pass
     print("输入无效，默认播放全部。")
-    return sorted(pairs, key=lambda p: p[0].stat().st_mtime)
+    return sorted(pairs, key=lambda pair: _file_creation_time_ns(pair[0]))
 
 
 def _resolve_marker_size(reader: ReplayReader, fallback: float = 10.0) -> float:
@@ -137,14 +163,23 @@ def _resolve_marker_size(reader: ReplayReader, fallback: float = 10.0) -> float:
     return float(fallback)
 
 
-def playback(target: str, interval: float = 0.2) -> None:
-    """使用 matplotlib 实时回放日志文件，支持目录或模型路径。"""
+def playback(
+    target: str,
+    interval: float = 0.2,
+    *,
+    start_step: int = 0,
+    use_latest: bool = False,
+) -> None:
+    """使用 matplotlib 回放日志，可选择起始 step 或显式使用最新日志。"""
+
+    if start_step < 0:
+        raise ValueError("start_step 不能为负数")
 
     pairs = _resolve_log_pairs(target)
     if not pairs:
         raise FileNotFoundError(f"未在 {target} 下找到日志文件")
 
-    pairs = _select_pairs(pairs)
+    pairs = _select_pairs(pairs, use_latest=use_latest)
     default_config = load_default_config()
     render_cfg = default_config.get("rendering", {})
     show_dead_markers = bool(render_cfg.get("show_dead_markers", True))
@@ -170,13 +205,9 @@ def playback(target: str, interval: float = 0.2) -> None:
             height = int(inferred_cells / max(width, 1))
 
         expected_bytes = height * width
-        map_iter = reader.iter_maps()
-        agent_iter = reader.iter_agents()
-
-        for map_line, agent_line in zip(map_iter, agent_iter):
+        for map_line, agent_data in reader.iter_frames(start_step=start_step):
             trimmed_line = map_line[: expected_bytes * 2]
             grid = decode_grid(trimmed_line, torch.Size((1, height, width)))[0]
-            agent_data = json.loads(agent_line)
             agent_state = torch.tensor(agent_data["agents"], dtype=torch.float32)
             display = torch.zeros((height, width))
             display = torch.where((grid & 1) > 0, torch.tensor(0.2), display)

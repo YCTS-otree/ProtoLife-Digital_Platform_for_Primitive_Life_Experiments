@@ -90,6 +90,27 @@ def test_environment_memory_reset_cannot_modify_forward_graph_storage():
     assert any(parameter.grad is not None for parameter in policy.parameters())
 
 
+def test_active_mask_skips_inactive_independent_brains():
+    policy = _build_independent_policy()
+    patches = torch.randn(1, 2, 6, 5, 5)
+    features = torch.rand(1, 2, 3)
+    hidden = torch.zeros(1, 2, 6)
+
+    logits, values, new_hidden = policy(
+        patches,
+        hidden,
+        features,
+        active_mask=torch.tensor([[True, False]]),
+    )
+    (logits.sum() + values.sum() + new_hidden.sum()).backward()
+
+    assert torch.count_nonzero(logits[0, 1]) == 0
+    assert torch.count_nonzero(values[0, 1]) == 0
+    assert torch.count_nonzero(new_hidden[0, 1]) == 0
+    assert any(parameter.grad is not None for parameter in policy.brains[0].parameters())
+    assert all(parameter.grad is None for parameter in policy.brains[1].parameters())
+
+
 def test_child_inherits_parent_policy_head_with_optional_mutation():
     policy = _build_independent_policy()
     parent = policy.brains[0].policy_head

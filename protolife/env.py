@@ -37,6 +37,7 @@ ENV_DEFAULTS = {
         "food_density": 0.03,
         "toxin_density": 0.01,
         "food_respawn_interval": 0,
+        "food_lifetime": 2048,
         "toxin_respawn_interval": 0,
         "toxin_lifetime": 0,
         "resource_noise": {
@@ -159,11 +160,30 @@ class ProtoLifeEnv:
         self.width = self._get("world", "width", ENV_DEFAULTS["world"]["width"])
         self.map_file = self._get("world", "map_file", ENV_DEFAULTS["world"].get("map_file"))
         self.observation_radius = self._get("model", "observation_radius", ENV_DEFAULTS["model"]["observation_radius"])
+        vision_offsets = torch.arange(
+            -self.observation_radius,
+            self.observation_radius + 1,
+            device=self.device,
+        )
+        vision_y, vision_x = torch.meshgrid(
+            vision_offsets, vision_offsets, indexing="ij"
+        )
+        self._vision_offset_y = vision_y.reshape(1, 1, -1)
+        self._vision_offset_x = vision_x.reshape(1, 1, -1)
+        self._vision_distances = torch.sqrt(
+            self._vision_offset_x.float().square()
+            + self._vision_offset_y.float().square()
+        )
         self.food_density = self._get("world", "food_density", ENV_DEFAULTS["world"]["food_density"])
         self.toxin_density = self._get("world", "toxin_density", ENV_DEFAULTS["world"]["toxin_density"])
         self.resource_noise_cfg = self._get("world", "resource_noise", ENV_DEFAULTS["world"]["resource_noise"])
         self.food_respawn_interval = self._get(
             "world", "food_respawn_interval", ENV_DEFAULTS["world"]["food_respawn_interval"]
+        )
+        self.food_lifetime = self._get(
+            "world",
+            "food_lifetime",
+            self._get("world", "food_decay_steps", ENV_DEFAULTS["world"]["food_lifetime"]),
         )
         self.toxin_respawn_interval = self._get(
             "world", "toxin_respawn_interval", ENV_DEFAULTS["world"]["toxin_respawn_interval"]
@@ -284,6 +304,9 @@ class ProtoLifeEnv:
         self.map_state = torch.zeros(
             (self.agent_batch.num_envs, self.height, self.width), dtype=torch.int64, device=self.device
         )
+        self.food_age = torch.zeros(
+            (self.agent_batch.num_envs, self.height, self.width), dtype=torch.int64, device=self.device
+        )
         self.toxin_age = torch.zeros(
             (self.agent_batch.num_envs, self.height, self.width), dtype=torch.int64, device=self.device
         )
@@ -331,8 +354,10 @@ class ProtoLifeEnv:
             self.map_state = self._map_template.clone().expand(self.agent_batch.num_envs, -1, -1).contiguous()
         else:
             self.map_state = self._generate_random_map().to(self.device)
+        self.food_age.zero_()
         self.toxin_age.zero_()
         self._scatter_resources(respawn=False)
+        self._reset_food_age_for_existing_food()
         self._reset_toxin_age_for_existing_toxins()
         self.step_count = 0
         self.agent_batch.reset(
@@ -357,7 +382,9 @@ class ProtoLifeEnv:
         后续可逐步填充能量代谢、食物/毒素交互、战斗等细节。
         """
 
-        actions_2d = actions.view(self.agent_batch.num_envs, self.agent_batch.agents_per_env)
+        actions_2d = actions.to(self.device).view(
+            self.agent_batch.num_envs, self.agent_batch.agents_per_env
+        )
         alive_at_start = self._alive_mask()
         actions_2d = torch.where(alive_at_start, actions_2d, torch.zeros_like(actions_2d))
         reproduction_events: List[Tuple[int, int, int]] = []
@@ -570,55 +597,7 @@ class ProtoLifeEnv:
         if self._get("rewards", "enable_proximity_reward", ENV_DEFAULTS["rewards"]["enable_proximity_reward"]):
             radius = self.observation_radius
             if radius > 0:
-                padded = F.pad(self.map_state.float().unsqueeze(1), (radius, radius, radius, radius))
-                kernel = 2 * radius + 1
-                patches = F.unfold(padded, kernel_size=kernel)  # (E, K, H*W)
-                flat_idx = y * self.width + x
-                gather_idx = flat_idx.unsqueeze(1).expand(-1, kernel * kernel, -1)
-                gathered = patches.gather(2, gather_idx).long()  # (E, K, A)
-                food_patch = (gathered & BIT_FOOD).bool()
-
-                offsets = torch.arange(-radius, radius + 1, device=self.device)
-                dy, dx = torch.meshgrid(offsets, offsets, indexing="ij")
-                distances = torch.sqrt(dx.float() ** 2 + dy.float() ** 2).view(1, -1, 1)
-                distances = distances.expand(self.agent_batch.num_envs, -1, self.agent_batch.agents_per_env)
-
-                food_distances = torch.where(
-                    food_patch,
-                    distances,
-                    torch.full_like(distances, float("inf")),
-                )
-                min_distances, _ = food_distances.min(dim=1)
-                food_found = torch.isfinite(min_distances) & (min_distances <= radius)
-                valid_distances = torch.where(food_found, min_distances, torch.zeros_like(min_distances))
-
-                decay_mode = self._get(
-                    "rewards", "vision_decay_mode", ENV_DEFAULTS["rewards"]["vision_decay_mode"]
-                ).lower()
-                decay_coeff = self._get(
-                    "rewards",
-                    "vision_decay_coefficient",
-                    ENV_DEFAULTS["rewards"]["vision_decay_coefficient"],
-                )
-                if decay_mode == "log":
-                    decay_scale = 1.0 / (1.0 + decay_coeff * torch.log1p(valid_distances))
-                else:
-                    decay_scale = torch.clamp(
-                        1.0 - decay_coeff * (valid_distances / max(radius, 1)), min=0.0
-                    )
-
-                see_reward = self._get(
-                    "rewards", "see_food_reward", ENV_DEFAULTS["rewards"]["see_food_reward"]
-                )
-                stand_on_reward = self._get(
-                    "rewards", "stand_on_food_reward", ENV_DEFAULTS["rewards"]["stand_on_food_reward"]
-                )
-                proximity_bonus = see_reward * decay_scale
-                stand_on_mask = (current_cells & BIT_FOOD).bool()
-                proximity_bonus = torch.where(
-                    stand_on_mask, stand_on_reward * decay_scale, proximity_bonus
-                )
-                rewards = rewards + torch.where(food_found, proximity_bonus, torch.zeros_like(rewards))
+                rewards = rewards + self._compute_proximity_food_bonus(x, y)
 
         eat_mask = actions_2d == 5
         food_mask = (current_cells & BIT_FOOD).bool()
@@ -633,6 +612,9 @@ class ProtoLifeEnv:
             energy,
         )
         self.map_state[env_ids, y, x] = torch.where(eat_success, current_cells & (~BIT_FOOD), current_cells)
+        self.food_age[env_ids, y, x] = torch.where(
+            eat_success, torch.zeros_like(self.food_age[env_ids, y, x]), self.food_age[env_ids, y, x]
+        )
 
         toxin_mask = (current_cells & BIT_TOXIN).bool() & alive_at_start
         eat_on_toxin = eat_mask & toxin_mask
@@ -668,7 +650,8 @@ class ProtoLifeEnv:
         # 周期性刷新资源/毒素
         self._maybe_respawn_resources()
 
-        # 毒素衰减
+        # 食物腐败与毒素衰减
+        self._decay_food()
         self._decay_toxins()
 
         if self.use_death:
@@ -705,6 +688,66 @@ class ProtoLifeEnv:
             infos=infos,
             reproduction_events=reproduction_events,
         )
+
+    def _compute_proximity_food_bonus(
+        self, x: torch.Tensor, y: torch.Tensor
+    ) -> torch.Tensor:
+        """直接采样个体周围坐标，避免每一步对整张地图执行 ``unfold``。"""
+
+        radius = self.observation_radius
+        sample_y = y.unsqueeze(-1) + self._vision_offset_y
+        sample_x = x.unsqueeze(-1) + self._vision_offset_x
+        in_bounds = (
+            (sample_y >= 0)
+            & (sample_y < self.height)
+            & (sample_x >= 0)
+            & (sample_x < self.width)
+        )
+        sample_y = sample_y.clamp(0, self.height - 1)
+        sample_x = sample_x.clamp(0, self.width - 1)
+        env_index = torch.arange(
+            self.agent_batch.num_envs, device=self.device
+        ).view(-1, 1, 1)
+        cells = self.map_state[env_index, sample_y, sample_x]
+
+        distances = self._vision_distances
+        visible_food = (cells & BIT_FOOD).bool() & in_bounds & (distances <= radius)
+        decay_mode = str(
+            self._get(
+                "rewards",
+                "vision_decay_mode",
+                ENV_DEFAULTS["rewards"]["vision_decay_mode"],
+            )
+        ).lower()
+        decay_coeff = float(
+            self._get(
+                "rewards",
+                "vision_decay_coefficient",
+                ENV_DEFAULTS["rewards"]["vision_decay_coefficient"],
+            )
+        )
+        if decay_mode == "log":
+            decay_scale = 1.0 / (1.0 + decay_coeff * torch.log1p(distances))
+        else:
+            decay_scale = torch.clamp(
+                1.0 - decay_coeff * (distances / max(radius, 1)), min=0.0
+            )
+        per_food_bonus = float(
+            self._get(
+                "rewards", "see_food_reward", ENV_DEFAULTS["rewards"]["see_food_reward"]
+            )
+        ) * decay_scale
+        center_index = radius * (2 * radius + 1) + radius
+        per_food_bonus[..., center_index] = float(
+            self._get(
+                "rewards",
+                "stand_on_food_reward",
+                ENV_DEFAULTS["rewards"]["stand_on_food_reward"],
+            )
+        )
+        return torch.where(
+            visible_food, per_food_bonus, torch.zeros_like(per_food_bonus)
+        ).sum(dim=-1)
 
     def _apply_curve(self, normalized: torch.Tensor, mode: str, coefficient: float) -> torch.Tensor:
         """根据模式调整 [0,1] 归一化值的曲线形状。"""
@@ -769,13 +812,12 @@ class ProtoLifeEnv:
         if self.energy_max <= 0:
             return torch.zeros_like(energy)
 
-        rewards = torch.zeros_like(energy)
         upper_mask = energy >= self.energy_reward_fit
-        lower_mask = energy < self.energy_reward_fit
-
-        if upper_mask.any() and self.energy_max > self.energy_reward_fit:
+        rewards = torch.zeros_like(energy)
+        if self.energy_max > self.energy_reward_fit:
             normalized_upper = torch.clamp(
-                (energy[upper_mask] - self.energy_reward_fit) / max(self.energy_max - self.energy_reward_fit, 1e-6),
+                (energy - self.energy_reward_fit)
+                / max(self.energy_max - self.energy_reward_fit, 1e-6),
                 0.0,
                 1.0,
             )
@@ -786,11 +828,13 @@ class ProtoLifeEnv:
                 self.energy_reward_mode,
                 self.energy_reward_coefficient,
             )
-            rewards = rewards.masked_scatter(upper_mask, rewards_upper)
+            rewards = torch.where(upper_mask, rewards_upper, rewards)
 
-        if lower_mask.any() and self.energy_reward_fit > 0:
+        lower_mask = ~upper_mask
+        if self.energy_reward_fit > 0:
             normalized_lower = torch.clamp(
-                (self.energy_reward_fit - energy[lower_mask]) / max(self.energy_reward_fit, 1e-6),
+                (self.energy_reward_fit - energy)
+                / max(self.energy_reward_fit, 1e-6),
                 0.0,
                 1.0,
             )
@@ -801,7 +845,7 @@ class ProtoLifeEnv:
                 self.energy_reward_mode,
                 self.energy_reward_coefficient,
             )
-            rewards = rewards.masked_scatter(lower_mask, rewards_lower)
+            rewards = torch.where(lower_mask, rewards_lower, rewards)
 
         return rewards
 
@@ -823,20 +867,23 @@ class ProtoLifeEnv:
             return health
 
         recovery_mask = energy > self.health_recovery_energy_threshold
-        if recovery_mask.any() and self.health_recovery_per_step != 0:
+        if self.health_recovery_per_step != 0:
             health = torch.where(recovery_mask, health + self.health_recovery_per_step, health)
 
         decay_mask = energy < self.health_recovery_energy_threshold
-        if decay_mask.any() and self.health_decay_min != 0:
+        if self.health_decay_min != 0:
             normalized = torch.clamp(
-                (self.health_recovery_energy_threshold - energy[decay_mask])
+                (self.health_recovery_energy_threshold - energy)
                 / max(self.health_recovery_energy_threshold, 1e-6),
                 0.0,
                 1.0,
             )
             decay_scale = self._apply_curve(normalized, self.health_decay_mode, self.health_decay_coefficient)
-            scaled_decay = torch.zeros_like(health)
-            scaled_decay[decay_mask] = decay_scale * self.health_decay_min
+            scaled_decay = torch.where(
+                decay_mask,
+                decay_scale * self.health_decay_min,
+                torch.zeros_like(health),
+            )
             health = health + scaled_decay
 
         return health
@@ -868,26 +915,32 @@ class ProtoLifeEnv:
         encoded = encode_grid(self.map_state)
         print(f"Encoded map snapshot: {encoded[:16]} ...")
 
-    def export_state(self) -> Dict[str, torch.Tensor]:
+    def export_state(self) -> Dict[str, object]:
         """导出环境状态用于 checkpoint。"""
 
         return {
             "map_state": self.map_state.detach().cpu(),
             "agent_state": self.agent_batch.state_dict(),
+            "food_age": self.food_age.detach().cpu(),
             "toxin_age": self.toxin_age.detach().cpu(),
             "step_count": torch.tensor(self.step_count, dtype=torch.int64),
+            "random_generator_state": self.random_generator.get_state().cpu(),
         }
 
-    def load_state(self, state: Dict[str, torch.Tensor]) -> None:
+    def load_state(self, state: Dict[str, object]) -> None:
         """从 checkpoint 恢复环境与个体状态。"""
 
         self.map_state = state["map_state"].to(self.device)
         self._map_template = self.map_state[:1].clone()
         self.agent_batch.load_state_dict(state["agent_state"], self.height, self.width)
         self._relocate_agents_inside_walls()
+        self.food_age = state.get("food_age", torch.zeros_like(self.map_state)).to(self.device)
         self.toxin_age = state.get("toxin_age", torch.zeros_like(self.map_state)).to(self.device)
         saved_step = state.get("step_count")
         self.step_count = int(saved_step.item()) if saved_step is not None else 0
+        generator_state = state.get("random_generator_state")
+        if generator_state is not None:
+            self.random_generator.set_state(generator_state.cpu())
 
     def _alive_mask(self) -> torch.Tensor:
         energy = self.agent_batch.state["energy"]
@@ -1131,14 +1184,29 @@ class ProtoLifeEnv:
                 if wall_mask is not None:
                     toxin_mask = toxin_mask & (~wall_mask)
 
+        existing_food = (self.map_state & BIT_FOOD).bool()
         existing_toxin = (self.map_state & BIT_TOXIN).bool()
         if food_mask is not None:
             self.map_state = torch.where(food_mask, self.map_state | BIT_FOOD, self.map_state)
+            if self.food_lifetime:
+                new_food_cells = food_mask & (~existing_food)
+                self.food_age = torch.where(
+                    new_food_cells, torch.zeros_like(self.food_age), self.food_age
+                )
         if toxin_mask is not None:
             self.map_state = torch.where(toxin_mask, self.map_state | BIT_TOXIN, self.map_state)
         if toxin_mask is not None and self.toxin_lifetime:
             new_toxin_cells = toxin_mask & (~existing_toxin)
             self.toxin_age = torch.where(new_toxin_cells, torch.zeros_like(self.toxin_age), self.toxin_age)
+
+    def _reset_food_age_for_existing_food(self) -> None:
+        """确保当前地图上的食物年龄归零，用于重置或从地图加载。"""
+
+        food_mask = (self.map_state & BIT_FOOD).bool()
+        if food_mask.any():
+            self.food_age = torch.where(
+                food_mask, torch.zeros_like(self.food_age), self.food_age
+            )
 
     def _reset_toxin_age_for_existing_toxins(self) -> None:
         """确保当前地图上的毒素年龄归零，用于重置或从地图加载。"""
@@ -1156,6 +1224,25 @@ class ProtoLifeEnv:
         if self.toxin_respawn_interval and self.toxin_respawn_interval > 0:
             if self.step_count % self.toxin_respawn_interval == 0:
                 self._scatter_resources(spawn_food=False, spawn_toxin=True, respawn=True)
+
+    def _decay_food(self) -> None:
+        """食物达到配置寿命后腐败并从地图移除。"""
+
+        if not self.food_lifetime or self.food_lifetime <= 0:
+            return
+
+        food_mask = (self.map_state & BIT_FOOD).bool()
+        self.food_age = torch.where(
+            food_mask, self.food_age + 1, torch.zeros_like(self.food_age)
+        )
+        expired = food_mask & (self.food_age >= self.food_lifetime)
+        if expired.any():
+            self.map_state = torch.where(
+                expired, self.map_state & (~BIT_FOOD), self.map_state
+            )
+            self.food_age = torch.where(
+                expired, torch.zeros_like(self.food_age), self.food_age
+            )
 
     def _decay_toxins(self) -> None:
         """当毒素存续超过寿命时将其从地图上移除。"""
